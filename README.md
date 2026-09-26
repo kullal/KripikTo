@@ -1,0 +1,93 @@
+# KripikTo: Sistem Pemindai Kripto Kuantitatif & Analisis Sentimen AI
+
+Sistem pemindai pasar aset kripto otomatis berbasis kombinasi data **Kuantitatif (Candlestick Klines + Whale Flow / Bandarmologi Paus)** dan **Kualitatif (Analisis Sentimen Berita Global dengan Google Gemini Flash LLM + Crypto Risk Guard)**.
+
+---
+
+## 🎯 Tujuan Proyek
+
+1. **Memantau Top 500 Koin Likuid (Pasangan USDT)**: Menyaring koin-koin aktif di bursa global (berdasarkan nilai transaksi/turnover USDT 24 jam) agar terbebas dari sinyal palsu pada koin mati (*zombie/illiquid coins*).
+2. **Penyaringan Otomatis Aset Non-Kripto**: Otomatis menyingkirkan pasangan *stablecoin-to-stablecoin* (seperti USDC, FDUSD, USDS), token saham AS ter-tokenisasi (*Apple, Tesla, Nvidia tokens*), dan emas (*XAUT*).
+3. **Deteksi Berbasis Kuantitatif & Whale Flow (*Smart Money Inflow*)**:
+   - Menggunakan metrik **Taker Buy Ratio** (persentase pembelian pasar agresif "hajar kanan").
+   - Deteksi *Whale Divergence*: Mendeteksi saat harga koin masih datar / koreksi tipis, tetapi paus memborong agresif di balik layar.
+   - Indikator teknikal: **MA20, MA50, Breakout 20-bar High, Volume Spike (>1.5x - 2x)**, dan **RSI 14** (Momentum sehat vs risiko pucuk overbought).
+4. **Crypto Risk Guard & Konfirmasi Berita AI (Google Gemini Flash)**:
+   - Mengambil headline berita global terkini via Google News RSS (*CoinDesk, Cointelegraph, Decrypt*, dll.).
+   - Mendeteksi risiko fatal: **Hack / Smart Contract Exploit, Gugatan Regulasi (SEC/CFTC), Pengumuman Delisting, atau Token Dumping**.
+   - Memberikan skor sentimen (-1.0 s.d +1.0) dan ringkasan katalis berita dalam **Bahasa Indonesia**.
+5. **Trading Plan Otomatis**:
+   - Menghitung **Buy Area, Stop Loss, Target Profit 1 & 2**, serta **Risk/Reward Ratio** secara terukur.
+
+---
+
+## 🏗️ Arsitektur Data
+
+| Komponen | Sumber Data | Keterangan |
+|---|---|---|
+| **Data Pasar 24 Jam** | Binance Public Vision API | Endpoint resmi `https://data-api.binance.vision` (Bebas akses di Indonesia tanpa VPN & tanpa API key). |
+| **Candlestick (Klines)** | Binance Public Vision API | Mendukung interval fleksibel: `2h` (default), `4h`, atau `1d` (limit 100 candle bergulir). |
+| **Whale Flow (Aliran Paus)** | Taker Buy Quote Volume | Menghitung rasio transaksi beli agresif (*market order*) terhadap total volume transaksi. |
+| **Universe Selection** | Filter Likuiditas USDT | Top 500 koin USDT dengan volume terbesar, bebas stablecoin & token leverage. |
+| **Berita Global** | Google News RSS Kripto | Mengambil berita terkini dari portal media kripto terkemuka di dunia. |
+| **Sentimen AI & Risk Guard** | Google Gemini Flash LLM | Model `gemini-flash-latest` / `gemini-3.8-flash` dengan respon JSON terstruktur. |
+| **Penyimpanan Lokal** | SQLite (`kripto.db`) & JSON | Penyimpanan lokal yang cepat, ringan, dan efisien di `backend/data/`. |
+
+---
+
+## 📁 Struktur Folder Proyek
+
+```text
+KripikTo/
+├── backend/
+│   ├── data/
+│   │   ├── kripto.db                  # Database SQLite lokal (Summary 24h, Klines, Scan Results, Sentiment)
+│   │   ├── scan_latest.json          # Hasil scan teknikal & whale flow
+│   │   └── final_recommendations.json # Hasil rekomendasi final + Trading Plan + Katalis AI
+│   ├── data_pipeline.py              # Pipa unduh data Binance Vision (Multithreading cepat)
+│   ├── scanner.py                    # Logika deteksi teknikal, RSI 14, dan Whale Inflow
+│   ├── news_sentiment.py             # Scraper berita kripto global & Analisis Sentimen Gemini LLM
+│   └── __init__.py
+├── main.py                           # Orkestrator utama: CLI terpadu 3 tahap
+├── .env                              # Kunci API Gemini (Terproteksi .gitignore)
+├── .env.example                      # Template konfigurasi environment
+├── .gitignore                        # Proteksi venv, db, dan kredensial
+├── .venv/                            # Python Virtual Environment
+├── requirements.txt                  # Daftar dependensi paket Python minimal
+└── README.md                         # Dokumentasi & panduan penggunaan sistem
+```
+
+---
+
+## 🚀 Cara Menjalankan Sistem (`main.py`)
+
+Pastikan virtual environment telah aktif:
+```bash
+# Di Windows PowerShell:
+.\.venv\Scripts\Activate.ps1
+```
+
+Cukup jalankan satu perintah berikut di terminal:
+
+```bash
+# 1. Jalankan alur penuh (Unduh 500 koin -> Scan -> Analisis Berita Gemini AI):
+python main.py
+
+# 2. Mengubah Timeframe Candlestick (misal grafik 4 jam atau harian):
+python main.py --interval 4h
+python main.py --interval 1d
+
+# 3. Mengatur jumlah koin teratas yang dianalisis beritanya oleh AI (misal Top 10 atau Top 25):
+python main.py --top 10
+
+# 4. Mode Cepat / Hemat Kuota (Melewati unduhan jika data baru saja diunduh hari ini):
+python main.py --skip-download --top 10
+```
+
+---
+
+## 📊 Bobot Penilaian Skor Akhir (Composite Scoring)
+
+- **Bobot Teknikal & Whale Flow**: `70%`
+- **Bobot Sentimen Berita AI**: `30%`
+- **Crypto Risk Guard Shield**: Jika terdeteksi berita peretasan (*hack*), eksploitasi, tuntutan keras SEC, atau delisting bursa, skor akhir **otomatis dipangkas maksimal ke angka 35** dan status rekomendasi diubah menjadi **`⚠️ AVOID (Hack / Exploit / Delisting Risk)`** untuk melindungi modal trader dari jebakan harga semu (*bull trap*).
