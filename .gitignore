@@ -1,0 +1,22 @@
+# Python Virtual Environment
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+
+# Database & Cache files
+backend/data/*.db
+backend/data/*.sqlite
+backend/data/*.json
+*.db
+*.sqlite
+
+# Environment Credentials
+.env
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
