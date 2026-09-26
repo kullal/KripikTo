@@ -23,6 +23,7 @@ if sys.platform == "win32" and sys.stdout.encoding.lower() != "utf-8":
 from backend.data_pipeline import run_pipeline, DB_PATH
 from backend.scanner import run_scanner, print_scan_report
 from backend.news_sentiment import run_news_sentiment_pipeline, print_final_executive_report
+from backend.macro_sentiment import fetch_fear_and_greed_index, print_macro_banner
 
 
 def run_all(
@@ -35,6 +36,12 @@ def run_all(
     print("\n" + "=" * 100)
     print(f"🚀 MEMULAI SISTEM ANALISIS KRIPTO (KRIPIKTO) | TIMEFRAME: [{interval.upper()}]")
     print("=" * 100)
+
+    # -------------------------------------------------------------
+    # TAHAP 0: BAROMETER REZIM PASAR MAKRO (FEAR & GREED INDEX)
+    # -------------------------------------------------------------
+    fgi = fetch_fear_and_greed_index()
+    print_macro_banner(fgi)
 
     # -------------------------------------------------------------
     # TAHAP 1: DATA PIPELINE (DOWNLOAD DATA BINANCE PUBLIC VISION)
@@ -50,10 +57,10 @@ def run_all(
         print("\n[LANGKAH 1/3] Melewati unduhan data (--skip-download aktif). Menggunakan database yang ada.")
 
     # -------------------------------------------------------------
-    # TAHAP 2: QUANTITATIVE & WHALE SCANNER
+    # TAHAP 2: QUANTITATIVE & WHALE SCANNER (ADAPTIF REZIM MAKRO)
     # -------------------------------------------------------------
     print(f"\n[LANGKAH 2/3] Memindai indikator teknikal & aliran dana paus untuk Top {top_picks_limit} koin...")
-    scan_picks = run_scanner(interval=interval, min_score=40, top_n=top_picks_limit)
+    scan_picks = run_scanner(interval=interval, min_score=40, top_n=top_picks_limit, fgi=fgi)
     if scan_picks.empty:
         print("[!] Tidak ada koin yang memenuhi kriteria scanner saat ini.")
         return
@@ -64,13 +71,14 @@ def run_all(
     # TAHAP 3: GLOBAL NEWS SCRAPING + GEMINI LLM SENTIMENT & RISK GUARD
     # -------------------------------------------------------------
     print(f"\n[LANGKAH 3/3] Mengambil berita global & menganalisis sentimen katalis dengan Google Gemini...")
-    final_picks = run_news_sentiment_pipeline(top_limit=top_picks_limit)
+    final_picks = run_news_sentiment_pipeline(top_limit=top_picks_limit, fgi=fgi)
 
     if final_picks:
         print_final_executive_report(final_picks)
         print("✅ Alur eksekusi selesai! Seluruh rekomendasi & Trading Plan tersimpan rapi di database SQLite.")
     else:
         print("[!] Gagal menyelesaikan analisis sentimen berita.")
+
 
 
 if __name__ == "__main__":

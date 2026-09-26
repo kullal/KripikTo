@@ -31,12 +31,18 @@ if sys.platform == "win32" and sys.stdout.encoding.lower() != "utf-8":
     except Exception:
         pass
 
-# Definisi path database & JSON
+# Import path database & macro sentiment
+try:
+    from backend.macro_sentiment import fetch_fear_and_greed_index
+except ImportError:
+    from macro_sentiment import fetch_fear_and_greed_index
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = str(DATA_DIR / "kripto.db")
 SCAN_JSON_PATH = str(DATA_DIR / "scan_latest.json")
+
 
 # Token non-kripto (saham AS ter-tokenisasi, emas, dan stablecoin/pegged) yang harus dikecualikan
 NON_CRYPTO_EXCLUSIONS = {
@@ -98,13 +104,21 @@ def run_scanner(
     interval: str = "2h",
     min_score: int = 40,
     top_n: int = 20,
+    fgi: Optional[Dict[str, Any]] = None,
     db_path: str = DB_PATH
 ) -> pd.DataFrame:
     """
-    Menjalankan pemindaian kuantitatif & whale flow pada seluruh koin di database.
+    Menjalankan pemindaian kuantitatif & whale flow pada seluruh koin di database,
+    diselaraskan dengan rezim sentimen makro Crypto Fear & Greed Index.
     Mengembalikan DataFrame berisi Top N koin teratas berdasarkan skor sinyal.
     """
     init_scanner_db(db_path)
+
+    if fgi is None:
+        fgi = fetch_fear_and_greed_index(db_path)
+
+    fgi_val = fgi.get("value", 50)
+    fgi_regime = fgi.get("regime", "NEUTRAL")
 
     with sqlite3.connect(db_path) as conn:
         df_klines = pd.read_sql(
@@ -230,16 +244,42 @@ def run_scanner(
             score -= 20
             signals.append("RISIKO_PUCUK (Naik >35%)")
 
+        # --- G. PENYESUAIAN REZIM MAKRO AKADEMIK (FEAR & GREED INDEX) ---
+        if fgi_regime == "EXTREME_FEAR":
+            # Riset: Penipisan likuiditas -> False breakout tinggi
+            if "BREAKOUT_20_BAR_HIGH" in signals:
+                score -= 8
+                signals.append("PENALTI_LIQUIDITY_DEPLETION")
+            # Riset: Smart money accumulation di harga diskon
+            if "WHALE_DIVERGENCE (Nyicil Diam-diam)" in signals:
+                score += 10
+                signals.append("SMART_MONEY_BOTTOM_BOOSTER")
+        elif fgi_regime == "GREED":
+            # Riset: Order-flow pressure searah -> Breakout win rate tinggi
+            if "BREAKOUT_20_BAR_HIGH" in signals and vol_ratio >= 1.4:
+                score += 5
+                signals.append("ORDER_FLOW_PRESSURE_BOOST")
+        elif fgi_regime == "EXTREME_GREED":
+            # Riset JBEF: Asymmetric tail risk (risiko flash dump tiba-tiba)
+            signals.append("⚠️ WASPADA_TAIL_RISK")
+
         score = max(0, min(100, score))
 
         if score < min_score:
             continue
 
-        # --- G. GENERATE TRADING PLAN OTOMATIS ---
-        # Stop Loss: Di bawah MA20 atau low terdekat, minimal 3.5%, maksimal 6.5%
+        # --- H. GENERATE TRADING PLAN OTOMATIS & ADAPTIF ---
+        # Stop Loss: Di bawah MA20 atau low terdekat
         support_level = max(ma20, prev_low20) if ma20 < close else close * 0.96
-        sl_price = round(min(close * 0.96, max(close * 0.935, support_level)), 6)
+
+        # Adaptasi Rezim: Perketat Stop Loss jika Extreme Greed
+        if fgi_regime == "EXTREME_GREED":
+            sl_price = round(min(close * 0.965, max(close * 0.95, support_level)), 6)
+        else:
+            sl_price = round(min(close * 0.96, max(close * 0.935, support_level)), 6)
+
         sl_pct = round(((sl_price - close) / close) * 100.0, 2)
+
 
         # Target Profit 1 & 2
         risk_dist = abs(close - sl_price)

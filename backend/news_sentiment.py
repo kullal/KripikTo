@@ -144,11 +144,12 @@ def fetch_news_for_crypto(symbol: str, max_items: int = 4) -> List[Dict[str, str
 def analyze_sentiment_with_gemini(
     symbol: str,
     news_items: List[Dict[str, str]],
-    api_key: str
+    api_key: str,
+    fgi_context: str = ""
 ) -> Dict[str, Any]:
     """
-    Mengirim headline berita ke Google Gemini Flash API untuk analisis sentimen & ekstraksi katalis.
-    Dilengkapi Crypto Risk Guard untuk mendeteksi bahaya Exploit, Delisting, atau Tuntutan SEC.
+    Mengirim headline berita ke Google Gemini Flash API untuk analisis sentimen & ekstraksi katalis,
+    diselaraskan dengan cuaca makro Crypto Fear & Greed Index.
     """
     base_coin = symbol.replace("USDT", "")
 
@@ -162,13 +163,16 @@ def analyze_sentiment_with_gemini(
         }
 
     headlines = "\n".join([f"- [{item['source']}] {item['title']}" for item in news_items])
+    macro_info = f"Sentimen Makro Pasar Kripto Global: {fgi_context}\n" if fgi_context else ""
 
     prompt = f"""
 Kamu adalah analis pasar aset kripto profesional yang objektif, teliti, dan mengutamakan manajemen risiko.
 Tugasmu: Analisis kumpulan berita terkini berikut untuk koin kripto {base_coin} ({symbol}).
 
+{macro_info}
 Kumpulan Berita Global Terbaru:
 {headlines}
+
 
 Instruksi Analisis:
 1. PERIKSA RISIKO KEAMANAN & REGULASI (CRYPTO RISK GUARD):
@@ -290,7 +294,11 @@ def get_recommendation_label(
         return "⏳ NEUTRAL / WAIT"
 
 
-def run_news_sentiment_pipeline(top_limit: int = 15, db_path: str = DB_PATH) -> List[Dict[str, Any]]:
+def run_news_sentiment_pipeline(
+    top_limit: int = 15,
+    fgi: Optional[Dict[str, Any]] = None,
+    db_path: str = DB_PATH
+) -> List[Dict[str, Any]]:
     """
     Menjalankan alur lengkap analisis sentimen berita LLM untuk koin hasil scan teratas.
     """
@@ -301,6 +309,10 @@ def run_news_sentiment_pipeline(top_limit: int = 15, db_path: str = DB_PATH) -> 
         return []
 
     init_news_db(db_path)
+
+    fgi_context = ""
+    if fgi:
+        fgi_context = f"{fgi.get('classification', 'Neutral')} ({fgi.get('value', 50)}/100) - {fgi.get('advice', '')}"
 
     # Baca kandidat koin dari file scan_latest.json atau SQLite
     scan_candidates = []
@@ -328,7 +340,13 @@ def run_news_sentiment_pipeline(top_limit: int = 15, db_path: str = DB_PATH) -> 
         print(f"    [{i+1}/{len(picks_to_analyze)}] Memeriksa berita untuk {sym} (Skor Teknikal: {tech_score})...")
 
         news_items = fetch_news_for_crypto(symbol=sym, max_items=4)
-        sentiment_res = analyze_sentiment_with_gemini(symbol=sym, news_items=news_items, api_key=api_key)
+        sentiment_res = analyze_sentiment_with_gemini(
+            symbol=sym,
+            news_items=news_items,
+            api_key=api_key,
+            fgi_context=fgi_context
+        )
+
 
         sentiment = sentiment_res["sentiment"]
         sent_score = sentiment_res["sentiment_score"]

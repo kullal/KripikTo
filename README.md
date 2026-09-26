@@ -25,6 +25,7 @@ Sistem pemindai pasar aset kripto otomatis berbasis kombinasi data **Kuantitatif
 
 | Komponen | Sumber Data | Keterangan |
 |---|---|---|
+| **Sentimen Makro Global** | Alternative.me API | **Crypto Fear & Greed Index** (Rezim pasar: Extreme Fear, Fear, Neutral, Greed, Extreme Greed). |
 | **Data Pasar 24 Jam** | Binance Public Vision API | Endpoint resmi `https://data-api.binance.vision` (Bebas akses di Indonesia tanpa VPN & tanpa API key). |
 | **Candlestick (Klines)** | Binance Public Vision API | Mendukung interval fleksibel: `2h` (default), `4h`, atau `1d` (limit 100 candle bergulir). |
 | **Whale Flow (Aliran Paus)** | Taker Buy Quote Volume | Menghitung rasio transaksi beli agresif (*market order*) terhadap total volume transaksi. |
@@ -44,9 +45,10 @@ KripikTo/
 │   │   ├── kripto.db                  # Database SQLite lokal (Summary 24h, Klines, Scan Results, Sentiment)
 │   │   ├── scan_latest.json          # Hasil scan teknikal & whale flow
 │   │   └── final_recommendations.json # Hasil rekomendasi final + Trading Plan + Katalis AI
-│   ├── data_pipeline.py              # Pipa unduh data Binance Vision (Multithreading cepat)
-│   ├── scanner.py                    # Logika deteksi teknikal, RSI 14, dan Whale Inflow
-│   ├── news_sentiment.py             # Scraper berita kripto global & Analisis Sentimen Gemini LLM
+│   ├── macro_sentiment.py            # Tahap 0: Barometer Sentimen Makro (Fear & Greed Index & Rezim Pasar)
+│   ├── data_pipeline.py              # Tahap 1: Pipa unduh data Binance Vision (Multithreading cepat)
+│   ├── scanner.py                    # Tahap 2: Logika deteksi teknikal, RSI 14, dan Whale Inflow (Adaptif Rezim)
+│   ├── news_sentiment.py             # Tahap 3: Scraper berita kripto global & Analisis Sentimen Gemini LLM
 │   └── __init__.py
 ├── main.py                           # Orkestrator utama: CLI terpadu 3 tahap
 ├── .env                              # Kunci API Gemini (Terproteksi .gitignore)
@@ -56,6 +58,7 @@ KripikTo/
 ├── requirements.txt                  # Daftar dependensi paket Python minimal
 └── README.md                         # Dokumentasi & panduan penggunaan sistem
 ```
+
 
 ---
 
