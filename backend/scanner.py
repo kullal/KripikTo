@@ -31,17 +31,20 @@ if sys.platform == "win32" and sys.stdout.encoding.lower() != "utf-8":
     except Exception:
         pass
 
-# Import path database & macro sentiment
+# Import path database & macro sentiment & derivatives
 try:
     from backend.macro_sentiment import fetch_fear_and_greed_index
+    from backend.derivatives_flow import fetch_derivatives_summary
 except ImportError:
     from macro_sentiment import fetch_fear_and_greed_index
+    from derivatives_flow import fetch_derivatives_summary
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = str(DATA_DIR / "kripto.db")
 SCAN_JSON_PATH = str(DATA_DIR / "scan_latest.json")
+
 
 
 # Token non-kripto (saham AS ter-tokenisasi, emas, dan stablecoin/pegged) yang harus dikecualikan
@@ -70,6 +73,8 @@ def init_scanner_db(db_path: str = DB_PATH) -> None:
                 price_change_pct REAL,
                 quote_vol_m REAL,
                 taker_buy_ratio REAL,
+                funding_rate REAL,
+                open_interest_m REAL,
                 rsi14 REAL,
                 vol_ratio REAL,
                 score INTEGER,
@@ -85,7 +90,17 @@ def init_scanner_db(db_path: str = DB_PATH) -> None:
                 PRIMARY KEY (scan_time, symbol)
             )
         """)
+        # Migrasi kolom otomatis jika belum ada
+        cursor.execute("PRAGMA table_info(scan_results)")
+        cols = [c[1] for c in cursor.fetchall()]
+        for col, ctype in [("funding_rate", "REAL"), ("open_interest_m", "REAL")]:
+            if col not in cols:
+                try:
+                    cursor.execute(f"ALTER TABLE scan_results ADD COLUMN {col} {ctype}")
+                except Exception:
+                    pass
         conn.commit()
+
 
 
 def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -120,7 +135,11 @@ def run_scanner(
     fgi_val = fgi.get("value", 50)
     fgi_regime = fgi.get("regime", "NEUTRAL")
 
+    # Ambil data derivatif (Funding Rate & Open Interest Binance Futures)
+    deriv_map = fetch_derivatives_summary(db_path)
+
     with sqlite3.connect(db_path) as conn:
+
         df_klines = pd.read_sql(
             "SELECT * FROM klines_history WHERE interval = ? ORDER BY symbol, open_time ASC",
             conn,
@@ -196,7 +215,28 @@ def run_scanner(
             score += 20
             signals.append("WHALE_DIVERGENCE (Nyicil Diam-diam)")
 
+        # Ambil data derivatif koin jika ada di Binance Futures
+        deriv = deriv_map.get(sym, {})
+        funding_rate = float(deriv.get("funding_rate", 0.0))
+        oi_m = float(deriv.get("open_interest_m", 0.0))
+
+        # --- A2. DETEKSI ANOMALI DERIVATIF (POTENSI SHORT SQUEEZE SPOT SCALPING) ---
+        if funding_rate <= -0.10:
+            score += 25
+            signals.append(f"EXTREME_SHORT_SQUEEZE (FR: {funding_rate:+.3f}%)")
+        elif funding_rate <= -0.02:
+            score += 15
+            signals.append(f"POTENSI_SHORT_SQUEEZE (FR: {funding_rate:+.3f}%)")
+        elif funding_rate >= +0.05:
+            score -= 15
+            signals.append("RISIKO_LONG_DUMP (Hindari Beli Pucuk)")
+
+        if oi_m >= 10.0 and funding_rate < -0.01:
+            score += 10
+            signals.append(f"BIG_OI_SHORT_POOL (${oi_m}M)")
+
         # --- B. DETEKSI AKSI HARGA & BREAKOUT ---
+
         if close > prev_high20 and prev_high20 > 0:
             score += 25
             signals.append("BREAKOUT_20_BAR_HIGH")
@@ -268,29 +308,26 @@ def run_scanner(
         if score < min_score:
             continue
 
-        # --- H. GENERATE TRADING PLAN OTOMATIS & ADAPTIF ---
-        # Stop Loss: Di bawah MA20 atau low terdekat
-        support_level = max(ma20, prev_low20) if ma20 < close else close * 0.96
-
-        # Adaptasi Rezim: Perketat Stop Loss jika Extreme Greed
+        # --- H. TRADING PLAN KHUSUS SPOT SCALPING (+6% QUICK TAKE PROFIT) ---
+        # Stop Loss Ketat: Di bawah MA20 / Low atau maksimal 3.8%
+        support_level = max(ma20, prev_low20) if ma20 < close else close * 0.962
         if fgi_regime == "EXTREME_GREED":
             sl_price = round(min(close * 0.965, max(close * 0.95, support_level)), 6)
         else:
-            sl_price = round(min(close * 0.96, max(close * 0.935, support_level)), 6)
+            sl_price = round(min(close * 0.962, max(close * 0.94, support_level)), 6)
 
         sl_pct = round(((sl_price - close) / close) * 100.0, 2)
 
+        # Target Utama Scalping Spot: +6.0% (Naik 6% langsung kunci cuan!)
+        tp1_pct = 6.0
+        tp1_price = round(close * 1.06, 6)
 
-        # Target Profit 1 & 2
-        risk_dist = abs(close - sl_price)
-        tp1_price = round(close + (risk_dist * 1.5), 6)
-        tp1_pct = round(((tp1_price - close) / close) * 100.0, 2)
+        # Target Extended: +12.0%
+        tp2_pct = 12.0
+        tp2_price = round(close * 1.12, 6)
 
-        tp2_price = round(close + (risk_dist * 2.8), 6)
-        tp2_pct = round(((tp2_price - close) / close) * 100.0, 2)
-
-        rr_ratio = f"1 : {round(abs(tp1_pct / sl_pct), 1)}" if abs(sl_pct) > 0 else "1 : 2.0"
-        buy_area = f"${round(close * 0.992, 4)} - ${round(close * 1.005, 4)}"
+        rr_ratio = f"1 : {round(abs(tp1_pct / sl_pct), 1)}" if abs(sl_pct) > 0 else "1 : 1.6"
+        buy_area = f"${round(close * 0.995, 4)} - ${round(close * 1.005, 4)}"
 
         results.append({
             "scan_time": now_utc_str,
@@ -299,6 +336,8 @@ def run_scanner(
             "price_change_pct": round(change_24h, 2),
             "quote_vol_m": round(quote_vol_m, 2),
             "taker_buy_ratio": round(taker_ratio, 2),
+            "funding_rate": funding_rate,
+            "open_interest_m": oi_m,
             "rsi14": round(rsi, 1),
             "vol_ratio": round(vol_ratio, 2),
             "score": int(score),
@@ -332,16 +371,16 @@ def run_scanner(
         insert_query = """
             INSERT OR REPLACE INTO scan_results (
                 scan_time, symbol, last_price, price_change_pct, quote_vol_m,
-                taker_buy_ratio, rsi14, vol_ratio, score, signals,
+                taker_buy_ratio, funding_rate, open_interest_m, rsi14, vol_ratio, score, signals,
                 buy_area, stop_loss, stop_loss_pct, tp1, tp1_pct, tp2, tp2_pct, risk_reward
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         records = [
             (
                 r["scan_time"], r["symbol"], r["last_price"], r["price_change_pct"], r["quote_vol_m"],
-                r["taker_buy_ratio"], r["rsi14"], r["vol_ratio"], r["score"], r["signals"],
-                r["buy_area"], r["stop_loss"], r["stop_loss_pct"], r["tp1"], r["tp1_pct"],
-                r["tp2"], r["tp2_pct"], r["risk_reward"]
+                r["taker_buy_ratio"], r["funding_rate"], r["open_interest_m"], r["rsi14"], r["vol_ratio"],
+                r["score"], r["signals"], r["buy_area"], r["stop_loss"], r["stop_loss_pct"],
+                r["tp1"], r["tp1_pct"], r["tp2"], r["tp2_pct"], r["risk_reward"]
             )
             for _, r in df_top_picks.iterrows()
         ]
@@ -360,28 +399,31 @@ def print_scan_report(df_picks: pd.DataFrame) -> None:
     if df_picks.empty:
         return
 
-    print("\n" + "=" * 115)
-    print("🔥 HASIL PEMINDAIAN KUANTITATIF & ALIRAN DANA PAUS (TOP PICKS KRIPTO)")
-    print("=" * 115)
-    print(f"{'NO':<3} {'SIMBOL':<12} {'HARGA ($)':<12} {'CHG 24H':<9} {'TURNOVER':<11} {'WHALE %':<9} {'RSI':<6} {'SKOR':<5} {'SINYAL UTAMA'}")
-    print("-" * 115)
+    print("\n" + "=" * 125)
+    print("🔥 HASIL PEMINDAIAN SPOT SCALPING & POTENSI SHORT SQUEEZE (TOP PICKS KRIPTO)")
+    print("=" * 125)
+    print(f"{'NO':<3} {'SIMBOL':<11} {'HARGA ($)':<11} {'CHG 24H':<9} {'TURNOVER':<10} {'WHALE %':<8} {'FUNDING %':<11} {'RSI':<6} {'SKOR':<5} {'SINYAL UTAMA'}")
+    print("-" * 125)
 
     for i, row in df_picks.iterrows():
         chg_str = f"{row['price_change_pct']:+.2f}%"
         whale_str = f"{row['taker_buy_ratio']:.1f}%"
+        fr_val = row.get('funding_rate', 0.0)
+        fr_str = f"{fr_val:+.3f}%" if pd.notnull(fr_val) else "0.000%"
         price_str = f"{row['last_price']:.4f}" if row['last_price'] < 1 else f"{row['last_price']:.2f}"
         turnover_str = f"${row['quote_vol_m']:.1f}M"
-        
+
         # Potong sinyal agar rapi di terminal
         sigs = row['signals']
         if len(sigs) > 42:
             sigs = sigs[:39] + "..."
 
-        print(f"{i+1:<3} {row['symbol']:<12} {price_str:<12} {chg_str:<9} {turnover_str:<11} {whale_str:<9} {row['rsi14']:<6.1f} {row['score']:<5} {sigs}")
+        print(f"{i+1:<3} {row['symbol']:<11} {price_str:<11} {chg_str:<9} {turnover_str:<10} {whale_str:<8} {fr_str:<11} {row['rsi14']:<6.1f} {row['score']:<5} {sigs}")
 
-    print("=" * 115)
-    print("💡 Keterangan Skor: >= 75 (Sangat Kuat / Paus Agresif) | 60 - 74 (Potensial Breakout) | 40 - 59 (Watchlist)")
+    print("=" * 125)
+    print("🎯 Strategi Spot Scalping: Target Profit Utama +6.0% langsung kunci keuntungan | Stop Loss ketat ~3.8%")
     print(f"📁 Rekap JSON tersimpan di: {SCAN_JSON_PATH}\n")
+
 
 
 if __name__ == "__main__":

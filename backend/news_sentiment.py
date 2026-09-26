@@ -61,6 +61,8 @@ def init_news_db(db_path: str = DB_PATH) -> None:
                 scan_time TEXT,
                 symbol TEXT,
                 tech_score INTEGER,
+                funding_rate REAL,
+                open_interest_m REAL,
                 sentiment TEXT,
                 sentiment_score REAL,
                 impact_level TEXT,
@@ -80,7 +82,17 @@ def init_news_db(db_path: str = DB_PATH) -> None:
                 PRIMARY KEY (scan_time, symbol)
             )
         """)
+        # Auto-migration jika kolom belum ada
+        cursor.execute("PRAGMA table_info(kripto_sentiment_analysis)")
+        cols = [c[1] for c in cursor.fetchall()]
+        for col, ctype in [("funding_rate", "REAL"), ("open_interest_m", "REAL")]:
+            if col not in cols:
+                try:
+                    cursor.execute(f"ALTER TABLE kripto_sentiment_analysis ADD COLUMN {col} {ctype}")
+                except Exception:
+                    pass
         conn.commit()
+
 
 
 def fetch_news_for_crypto(symbol: str, max_items: int = 4) -> List[Dict[str, str]]:
@@ -337,16 +349,23 @@ def run_news_sentiment_pipeline(
     for i, item in enumerate(picks_to_analyze):
         sym = item["symbol"]
         tech_score = int(item["score"])
-        print(f"    [{i+1}/{len(picks_to_analyze)}] Memeriksa berita untuk {sym} (Skor Teknikal: {tech_score})...")
+        fr = float(item.get("funding_rate", 0.0))
+        oi_m = float(item.get("open_interest_m", 0.0))
+        print(f"    [{i+1}/{len(picks_to_analyze)}] Memeriksa berita untuk {sym} (Skor Teknikal: {tech_score}, FR: {fr:+.3f}%)...")
+
+        # Tambahkan konteks Short Squeeze ke prompt jika Funding Rate negatif
+        coin_fgi_context = fgi_context
+        if fr <= -0.015:
+            squeeze_note = f"\nKondisi Derivatif Koin: Funding Rate {fr:+.4f}% (Potensi SHORT SQUEEZE: Posisi short ritel over-leveraged, rawan terlikuidasi jika harga spot naik)."
+            coin_fgi_context = (fgi_context + squeeze_note) if fgi_context else squeeze_note.strip()
 
         news_items = fetch_news_for_crypto(symbol=sym, max_items=4)
         sentiment_res = analyze_sentiment_with_gemini(
             symbol=sym,
             news_items=news_items,
             api_key=api_key,
-            fgi_context=fgi_context
+            fgi_context=coin_fgi_context
         )
-
 
         sentiment = sentiment_res["sentiment"]
         sent_score = sentiment_res["sentiment_score"]
@@ -361,6 +380,8 @@ def run_news_sentiment_pipeline(
             "scan_time": now_utc_str,
             "symbol": sym,
             "tech_score": tech_score,
+            "funding_rate": fr,
+            "open_interest_m": oi_m,
             "sentiment": sentiment,
             "sentiment_score": sent_score,
             "impact_level": impact,
@@ -389,18 +410,18 @@ def run_news_sentiment_pipeline(
         cursor = conn.cursor()
         insert_query = """
             INSERT OR REPLACE INTO kripto_sentiment_analysis (
-                scan_time, symbol, tech_score, sentiment, sentiment_score,
-                impact_level, catalyst, news_count, crypto_risk, final_score,
-                recommendation, buy_area, stop_loss, stop_loss_pct, tp1, tp1_pct,
-                tp2, tp2_pct, risk_reward
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                scan_time, symbol, tech_score, funding_rate, open_interest_m,
+                sentiment, sentiment_score, impact_level, catalyst, news_count,
+                crypto_risk, final_score, recommendation, buy_area, stop_loss,
+                stop_loss_pct, tp1, tp1_pct, tp2, tp2_pct, risk_reward
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         records = [
             (
-                r["scan_time"], r["symbol"], r["tech_score"], r["sentiment"], r["sentiment_score"],
-                r["impact_level"], r["catalyst"], r["news_count"], r["crypto_risk"], r["final_score"],
-                r["recommendation"], r["buy_area"], r["stop_loss"], r["stop_loss_pct"], r["tp1"],
-                r["tp1_pct"], r["tp2"], r["tp2_pct"], r["risk_reward"]
+                r["scan_time"], r["symbol"], r["tech_score"], r["funding_rate"], r["open_interest_m"],
+                r["sentiment"], r["sentiment_score"], r["impact_level"], r["catalyst"], r["news_count"],
+                r["crypto_risk"], r["final_score"], r["recommendation"], r["buy_area"], r["stop_loss"],
+                r["stop_loss_pct"], r["tp1"], r["tp1_pct"], r["tp2"], r["tp2_pct"], r["risk_reward"]
             )
             for r in final_results
         ]
@@ -419,33 +440,35 @@ def print_final_executive_report(final_picks: List[Dict[str, Any]]) -> None:
     if not final_picks:
         return
 
-    print("\n" + "=" * 125)
-    print("💎 REKOMENDASI FINAL KRIPTO: GABUNGAN TEKNIKAL, PAUS & SENTIMEN AI GEMINI")
-    print("=" * 125)
-    print(f"{'NO':<3} {'SIMBOL':<11} {'TEK':<5} {'BERITA':<9} {'AKHIR':<6} {'REKOMENDASI':<34} {'KATALIS UTAMA AI'}")
-    print("-" * 125)
+    print("\n" + "=" * 130)
+    print("💎 REKOMENDASI FINAL SPOT SCALPING: GABUNGAN TEKNIKAL, PAUS, FUNDING RATE & AI")
+    print("=" * 130)
+    print(f"{'NO':<3} {'SIMBOL':<11} {'TEK':<4} {'FUNDING':<10} {'BERITA':<9} {'AKHIR':<6} {'REKOMENDASI':<34} {'KATALIS UTAMA AI'}")
+    print("-" * 130)
 
     for i, r in enumerate(final_picks):
         sent_badge = f"{r['sentiment']} ({r['sentiment_score']:+.1f})"
+        fr_str = f"{r.get('funding_rate', 0.0):+.3f}%"
         catalyst_short = r['catalyst']
-        if len(catalyst_short) > 52:
-            catalyst_short = catalyst_short[:49] + "..."
+        if len(catalyst_short) > 48:
+            catalyst_short = catalyst_short[:45] + "..."
 
-        print(f"{i+1:<3} {r['symbol']:<11} {r['tech_score']:<5} {sent_badge:<9} {r['final_score']:<6} {r['recommendation']:<34} {catalyst_short}")
+        print(f"{i+1:<3} {r['symbol']:<11} {r['tech_score']:<4} {fr_str:<10} {sent_badge:<9} {r['final_score']:<6} {r['recommendation']:<34} {catalyst_short}")
 
-    print("=" * 125)
-    print("\n📋 TRADING PLAN DETAIL (TOP 3 PICKS):")
+    print("=" * 130)
+    print("\n📋 TRADING PLAN SPOT SCALPING (TOP 3 PICKS - TARGET PROFIT +6.0%):")
     print("-" * 75)
     for i, r in enumerate(final_picks[:3]):
         print(f"#{i+1} {r['symbol']} | Rekomendasi: {r['recommendation']}")
         print(f"   Buy Area   : {r['buy_area']}")
         print(f"   Stop Loss  : ${r['stop_loss']} ({r['stop_loss_pct']}%)")
-        print(f"   TP 1       : ${r['tp1']} (+{r['tp1_pct']}%)")
-        print(f"   TP 2       : ${r['tp2']} (+{r['tp2_pct']}%)")
+        print(f"   TP 1 (Scalp): ${r['tp1']} (+{r['tp1_pct']}%) -> Target Jual Otomatis!")
+        print(f"   TP 2 (Ext) : ${r['tp2']} (+{r['tp2_pct']}%)")
         print(f"   Risk/Reward: {r['risk_reward']}")
         print(f"   Katalis AI : {r['catalyst']}\n")
-    print("=" * 125)
+    print("=" * 130)
     print(f"📁 Rekap JSON final tersimpan di: {FINAL_JSON_PATH}\n")
+
 
 
 if __name__ == "__main__":
