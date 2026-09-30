@@ -27,14 +27,16 @@ from backend.macro_sentiment import fetch_fear_and_greed_index, print_macro_bann
 
 
 def run_all(
-    interval: str = "2h",
+    interval: str = "4h",
     top_picks_limit: int = 15,
-    top_liquid_limit: int = 500,
-    skip_download: bool = False
+    top_liquid_limit: int = 200,
+    skip_download: bool = False,
+    mtf: bool = True
 ) -> None:
     """Menjalankan seluruh tahapan analisis kripto secara terpadu."""
     print("\n" + "=" * 100)
-    print(f"🚀 MEMULAI SISTEM ANALISIS KRIPTO (KRIPIKTO) | TIMEFRAME: [{interval.upper()}]")
+    mode_str = "MULTI-TIMEFRAME (4H + 1H + 15M)" if mtf else f"SINGLE TIMEFRAME [{interval.upper()}]"
+    print(f"🚀 MEMULAI SISTEM ANALISIS KRIPTO (KRIPIKTO) | MODE: {mode_str}")
     print("=" * 100)
 
     # -------------------------------------------------------------
@@ -47,9 +49,9 @@ def run_all(
     # TAHAP 1: DATA PIPELINE (DOWNLOAD DATA BINANCE PUBLIC VISION)
     # -------------------------------------------------------------
     if not skip_download:
-        print(f"\n[LANGKAH 1/3] Mengunduh ringkasan pasar & candlestick Top {top_liquid_limit} koin likuid...")
+        print(f"\n[LANGKAH 1/3] Mengunduh ringkasan pasar & candlestick MTF Top {top_liquid_limit} koin likuid...")
         try:
-            run_pipeline(interval=interval, top_n=top_liquid_limit, limit=100)
+            run_pipeline(interval=interval, mtf=mtf, top_n=top_liquid_limit, limit=100)
         except Exception as e:
             print(f"[!] Terjadi kendala saat mengunduh data Binance ({e}).")
             print("[*] Mencoba melanjutkan analisis menggunakan data lokal yang tersedia di kripto.db...")
@@ -86,9 +88,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--interval",
         type=str,
-        default="2h",
-        choices=["1h", "2h", "4h", "1d"],
-        help="Interval candlestick untuk analisis (default: 2h, pilihan: 1h, 2h, 4h, 1d)"
+        default="4h",
+        choices=["15m", "1h", "2h", "4h", "1d"],
+        help="Interval candlestick struktural untuk analisis (default: 4h, pilihan: 15m, 1h, 2h, 4h, 1d)"
     )
     parser.add_argument(
         "--top",
@@ -99,13 +101,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "--liquid",
         type=int,
-        default=500,
-        help="Jumlah koin likuid yang dipantau dari Binance (default: 500)"
+        default=200,
+        help="Jumlah koin likuid yang dipantau dari Binance (default: 200)"
     )
     parser.add_argument(
         "--skip-download",
         action="store_true",
         help="Lewati unduhan data jika database kripto.db sudah diperbarui baru-baru ini"
+    )
+    parser.add_argument(
+        "--no-mtf",
+        action="store_true",
+        help="Nonaktifkan unduhan multi-timeframe (hanya unduh single interval)"
     )
 
     args = parser.parse_args()
@@ -113,5 +120,6 @@ if __name__ == "__main__":
         interval=args.interval,
         top_picks_limit=args.top,
         top_liquid_limit=args.liquid,
-        skip_download=args.skip_download
+        skip_download=args.skip_download,
+        mtf=not args.no_mtf
     )
