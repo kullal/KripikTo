@@ -295,13 +295,19 @@ def get_recommendation_label(
     final_score: int,
     sentiment: str,
     tech_score: int,
-    crypto_risk: bool = False
+    crypto_risk: bool = False,
+    entry_status: str = "WAIT",
+    setup_type: str = "NO_SETUP"
 ) -> str:
-    """Menentukan label rekomendasi berdasarkan skor gabungan dan pengaman risiko."""
+    """Menentukan label rekomendasi berdasarkan skor gabungan, status trigger 15M, dan pengaman risiko."""
     if crypto_risk:
         return "⚠️ AVOID (Hack / Exploit / Delisting Risk)"
     elif tech_score >= 75 and sentiment == "BEARISH":
         return "⚠️ CAUTION (Bad News Divergence)"
+    elif entry_status == "TRIGGERED":
+        return "🎯 TRIGGERED_BUY (15M Valid)"
+    elif setup_type == "ACCUMULATION_COIL":
+        return "⏳ ACCUMULATION (Paus Diam)"
     elif final_score >= 80:
         return "🚀 STRONG_BUY (Paus + Katalis Bullish)"
     elif final_score >= 65:
@@ -379,12 +385,15 @@ def run_news_sentiment_pipeline(
         catalyst = sentiment_res["catalyst"]
         crypto_risk = sentiment_res["crypto_risk"]
 
-        final_score = calculate_composite_score(tech_score, sent_score, crypto_risk)
-        recom = get_recommendation_label(final_score, sentiment, tech_score, crypto_risk)
-
         v2_score = int(item.get("v2_score", tech_score))
         setup_type = str(item.get("setup_type", "NO_SETUP"))
         entry_status = str(item.get("entry_status", "WAIT"))
+
+        final_score = calculate_composite_score(tech_score, sent_score, crypto_risk)
+        recom = get_recommendation_label(
+            final_score, sentiment, tech_score, crypto_risk,
+            entry_status=entry_status, setup_type=setup_type
+        )
 
         record = {
             "scan_time": now_utc_str,

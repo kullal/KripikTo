@@ -50,23 +50,25 @@ SCAN_JSON_PATH = str(DATA_DIR / "scan_latest.json")
 try:
     from backend.data_pipeline import (
         is_stablecoin_or_excluded, NON_CRYPTO_PAIRS, STABLECOIN_PAIRS,
-        get_active_spot_symbols, get_btc_benchmark
+        get_active_spot_symbols, get_btc_benchmark, fetch_15m_trigger_batch
     )
     from backend.feature_engine import (
         extract_1h_momentum_features,
         classify_setup_and_status,
         calculate_dynamic_tp_sl,
+        evaluate_15m_trigger,
         DEFAULT_WEIGHTS
     )
 except ImportError:
     from data_pipeline import (
         is_stablecoin_or_excluded, NON_CRYPTO_PAIRS, STABLECOIN_PAIRS,
-        get_active_spot_symbols, get_btc_benchmark
+        get_active_spot_symbols, get_btc_benchmark, fetch_15m_trigger_batch
     )
     from feature_engine import (
         extract_1h_momentum_features,
         classify_setup_and_status,
         calculate_dynamic_tp_sl,
+        evaluate_15m_trigger,
         DEFAULT_WEIGHTS
     )
 
@@ -223,10 +225,11 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def run_scanner(
-    interval: str = "2h",
+    interval: str = "4h",
     min_score: int = 40,
     top_n: int = 20,
     fgi: Optional[Dict[str, Any]] = None,
+    trigger_15m: bool = True,
     db_path: str = DB_PATH
 ) -> pd.DataFrame:
     """
@@ -713,6 +716,89 @@ def run_scanner(
 
     df_top_picks = df_results.head(top_n).copy()
 
+    # =========================================================================
+    # 5. TAHAP 15M TACTICAL TRIGGER CONFIRMATION (KRIPIKTO v2 FASE 5)
+    # =========================================================================
+    if trigger_15m and not df_top_picks.empty:
+        candidate_syms = df_top_picks[
+            (df_top_picks["v2_score"] >= 40) &
+            (df_top_picks["setup_type"].isin(["MOMENTUM_RUNNER", "STRUCTURE_BULLISH", "ACCUMULATION_COIL"]))
+        ]["symbol"].tolist()
+
+        if candidate_syms:
+            print(f"[*] [Fase 5] Mengunduh & memvalidasi pemicu taktis 15M untuk {len(candidate_syms)} koin kandidat...")
+            try:
+                fetch_15m_trigger_batch(symbols=candidate_syms, limit=60, db_path=db_path)
+                with sqlite3.connect(db_path) as conn:
+                    placeholders = ",".join(["?"] * len(candidate_syms))
+                    df_15m = pd.read_sql(
+                        f"""
+                        SELECT symbol, open_time, open, high, low, close, volume
+                        FROM klines_history
+                        WHERE interval = '15m' AND symbol IN ({placeholders}) AND (is_closed = 1 OR is_closed IS NULL)
+                        ORDER BY symbol, open_time ASC
+                        """,
+                        conn,
+                        params=candidate_syms
+                    )
+
+                trigger_15m_map = evaluate_15m_trigger(df_15m)
+
+                for idx, r in df_top_picks.iterrows():
+                    sym = r["symbol"]
+                    t_info = trigger_15m_map.get(sym)
+                    if t_info:
+                        t_status = t_info["trigger_status"]
+                        t_reason = t_info["trigger_reason"]
+                        t_tags = t_info.get("tags", [])
+
+                        # Jika setup mendapatkan konfirmasi 15M (Breakout vol spike atau retest bounce)
+                        if t_status == "TRIGGERED":
+                            df_top_picks.at[idx, "entry_status"] = "TRIGGERED"
+                            # Perketat Buy Area dengan mikro-support 15M
+                            ref_low = t_info["refined_buy_low"]
+                            ref_high = t_info["refined_buy_high"]
+                            ref_entry = (ref_low + ref_high) / 2.0
+                            df_top_picks.at[idx, "buy_low"] = ref_low
+                            df_top_picks.at[idx, "buy_high"] = ref_high
+                            df_top_picks.at[idx, "buy_area"] = f"${ref_low} - ${ref_high}"
+                            df_top_picks.at[idx, "entry_price"] = ref_entry
+
+                            # Hitung ulang TP/SL dinamis dengan entry price presisi 15M
+                            dec = 8 if r["last_price"] < 0.01 else (6 if r["last_price"] < 1.0 else 4)
+                            new_targets = calculate_dynamic_tp_sl(
+                                entry_price=ref_entry,
+                                support_level=t_info["micro_support"],
+                                atr_val=float(r["atr14"]),
+                                dec=dec
+                            )
+                            df_top_picks.at[idx, "stop_loss"] = new_targets["stop_loss"]
+                            df_top_picks.at[idx, "stop_loss_pct"] = new_targets["stop_loss_pct"]
+                            df_top_picks.at[idx, "tp1"] = new_targets["tp1"]
+                            df_top_picks.at[idx, "tp1_pct"] = new_targets["tp1_pct"]
+                            df_top_picks.at[idx, "tp2"] = new_targets["tp2"]
+                            df_top_picks.at[idx, "tp2_pct"] = new_targets["tp2_pct"]
+                            df_top_picks.at[idx, "risk_reward"] = new_targets["risk_reward"]
+
+                        elif t_status == "EXTENDED":
+                            if r["entry_status"] != "WAIT":
+                                df_top_picks.at[idx, "entry_status"] = "EXTENDED"
+                        elif t_status == "FAILED":
+                            if r["setup_type"] != "ACCUMULATION_COIL":
+                                df_top_picks.at[idx, "entry_status"] = "FAILED"
+
+                        # Tambahkan sinyal & alasan 15M
+                        cur_signals = r["signals"]
+                        all_sigs = [s.strip() for s in cur_signals.split(",") if s.strip()] if cur_signals else []
+                        if t_reason not in all_sigs:
+                            all_sigs.insert(0, t_reason)
+                        for tg in t_tags:
+                            if tg not in all_sigs:
+                                all_sigs.append(tg)
+                        df_top_picks.at[idx, "signals"] = ", ".join(all_sigs)
+            except Exception as e:
+                print(f"[!] Evaluasi trigger 15M dilewati karena kendala: {e}")
+
     # Simpan hasil scan ke SQLite
     with sqlite3.connect(db_path) as conn:
         cursor = conn.cursor()
@@ -789,10 +875,14 @@ def print_scan_report(df_picks: pd.DataFrame) -> None:
         chg_str = f"{row['price_change_pct']:+.1f}%"
         setup_str = row.get("setup_type", "NO_SETUP")
         status_str = row.get("entry_status", "WAIT")
-        if status_str == "READY":
+        if status_str == "TRIGGERED":
+            status_str = "🎯 TRIGGER"
+        elif status_str == "READY":
             status_str = "🚀 READY"
         elif status_str == "EXTENDED":
             status_str = "⚠️ EXT"
+        elif status_str == "FAILED":
+            status_str = "❌ FAIL"
         else:
             status_str = "⏳ WAIT"
 
@@ -817,7 +907,7 @@ def print_scan_report(df_picks: pd.DataFrame) -> None:
         print(f"{i+1:<3} {row['symbol']:<10} {price_str:<10} {chg_str:<8} {setup_str:<18} {status_str:<9} {v2_s:<5} {str_s:<4} {mom_s:<4} {flw_s:<4} {rs4_str:<7} {rs1_str:<7} {tp1_p:<7} {sl_p:<7} {sigs}")
 
     print("=" * 145)
-    print("💡 Taksonomi: MOMENTUM_RUNNER = Siap eksekusi | ACCUMULATION_COIL = Paus akumulasi diam-diam (Watchlist) | VOLATILITY_SQUEEZE = Tunggu ekspansi")
+    print("💡 Taksonomi: TRIGGER = Konfirmasi 15M valid (Eksekusi Sekarang) | READY = Momentum runner (Menunggu 15M) | WAIT = Akumulasi/Squeeze")
     print("🎯 Target Dinamis: TP1 & SL dikalkulasi adaptif via ATR 1H & Support struktural (Validasi Empiris Outcome Tracker)")
     print(f"📁 Rekap JSON tersimpan di: {SCAN_JSON_PATH}\n")
 
