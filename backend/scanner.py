@@ -34,10 +34,10 @@ if sys.platform == "win32" and sys.stdout.encoding.lower() != "utf-8":
 # Import path database & macro sentiment & derivatives
 try:
     from backend.macro_sentiment import fetch_fear_and_greed_index
-    from backend.derivatives_flow import fetch_derivatives_summary
+    from backend.derivatives_flow import fetch_derivatives_summary, get_derivatives_deltas
 except ImportError:
     from macro_sentiment import fetch_fear_and_greed_index
-    from derivatives_flow import fetch_derivatives_summary
+    from derivatives_flow import fetch_derivatives_summary, get_derivatives_deltas
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -50,7 +50,7 @@ SCAN_JSON_PATH = str(DATA_DIR / "scan_latest.json")
 try:
     from backend.data_pipeline import (
         is_stablecoin_or_excluded, NON_CRYPTO_PAIRS, STABLECOIN_PAIRS,
-        get_active_spot_symbols, get_btc_benchmark, fetch_15m_trigger_batch
+        get_active_spot_symbols, get_btc_benchmark, get_btc_benchmark_time_series, fetch_15m_trigger_batch
     )
     from backend.feature_engine import (
         extract_1h_momentum_features,
@@ -62,7 +62,7 @@ try:
 except ImportError:
     from data_pipeline import (
         is_stablecoin_or_excluded, NON_CRYPTO_PAIRS, STABLECOIN_PAIRS,
-        get_active_spot_symbols, get_btc_benchmark, fetch_15m_trigger_batch
+        get_active_spot_symbols, get_btc_benchmark, get_btc_benchmark_time_series, fetch_15m_trigger_batch
     )
     from feature_engine import (
         extract_1h_momentum_features,
@@ -174,7 +174,10 @@ def init_scanner_db(db_path: str = DB_PATH) -> None:
             ("roc_1h", "REAL"),
             ("acceleration_1h", "REAL"),
             ("atr_expansion", "REAL"),
-            ("vol_ratio_1h", "REAL")
+            ("vol_ratio_1h", "REAL"),
+            ("delta_oi_1h", "REAL"),
+            ("delta_oi_4h", "REAL"),
+            ("delta_funding_1h", "REAL")
         ]
         for col, ctype in new_cols:
             if col not in cols:
@@ -193,7 +196,9 @@ def init_scanner_db(db_path: str = DB_PATH) -> None:
             ("v2_score", "INTEGER"), ("setup_type", "TEXT"),
             ("entry_status", "TEXT"), ("structure_score", "INTEGER"),
             ("momentum_score", "INTEGER"), ("flow_score", "INTEGER"),
-            ("derivative_score", "INTEGER")
+            ("derivative_score", "INTEGER"),
+            ("delta_oi_1h", "REAL"), ("delta_oi_4h", "REAL"),
+            ("delta_funding_1h", "REAL")
         ]:
             if col not in so_cols:
                 try:
@@ -253,6 +258,8 @@ def run_scanner(
     btc_bench = get_btc_benchmark(db_path)
     btc_ret_4h = float(btc_bench.get("btc_return_4h", 0.0))
     btc_ret_1h = float(btc_bench.get("btc_return_1h", 0.0))
+    btc_series_4h = get_btc_benchmark_time_series(interval="4h", db_path=db_path)
+    btc_series_1h = get_btc_benchmark_time_series(interval="1h", db_path=db_path)
 
     with sqlite3.connect(db_path) as conn:
         df_klines = pd.read_sql(
@@ -345,14 +352,20 @@ def run_scanner(
         quote_vol_m = quote_vol_24h / 1_000_000.0
         candle_close_time = str(row.get("datetime_utc", ""))
 
-        # Data derivatif
+        # Data derivatif & time-series deltas (Fase 4)
         deriv = deriv_map.get(sym, {})
+        deltas = get_derivatives_deltas(sym, db_path)
         funding_rate = float(deriv.get("funding_rate", 0.0))
         oi_m = float(deriv.get("open_interest_m", 0.0))
+        delta_oi_1h = float(deltas.get("delta_oi_1h", 0.0))
+        delta_oi_4h = float(deltas.get("delta_oi_4h", 0.0))
+        delta_funding_1h = float(deltas.get("delta_funding_1h", 0.0))
 
-        # Relative Strength 4H & 1H vs BTC
+        # Relative Strength 4H vs BTC dengan verifikasi keselarasan timestamp (Fase 2)
+        coin_open_time = int(row.get("open_time", 0))
         coin_ret_4h = round(float(row["ret_candle"]), 2) if pd.notnull(row.get("ret_candle")) else 0.0
-        rs_4h = round(coin_ret_4h - btc_ret_4h, 2)
+        btc_matched_ret_4h = btc_series_4h.get(coin_open_time, btc_ret_4h)
+        rs_4h = round(coin_ret_4h - btc_matched_ret_4h, 2)
 
         # Fitur kinetik 1H dari feature_engine
         feat_1h = feat_1h_map.get(sym, {
@@ -362,7 +375,8 @@ def run_scanner(
             "atr_1h": float(row["atr14"]) if pd.notnull(row.get("atr14")) else (close * 0.035),
             "atr_expansion_ratio": 1.0,
             "vol_ratio_1h": 1.0,
-            "rs_1h": 0.0
+            "rs_1h": 0.0,
+            "open_time_1h": 0
         })
         roc_1h = float(feat_1h.get("roc_1h", 0.0))
         accel_1h = float(feat_1h.get("acceleration_1h", 0.0))
@@ -370,7 +384,11 @@ def run_scanner(
         vol_r_1h = float(feat_1h.get("vol_ratio_1h", 1.0))
         atr_1h = float(feat_1h.get("atr_1h") or row["atr14"] or (close * 0.035))
         coin_ret_1h = roc_1h if roc_1h != 0.0 else ret_1h_map.get(sym, 0.0)
-        rs_1h = float(feat_1h.get("rs_1h", round(coin_ret_1h - btc_ret_1h, 2)))
+
+        # RS 1H terverifikasi timestamp
+        open_time_1h = int(feat_1h.get("open_time_1h", 0))
+        btc_matched_ret_1h = btc_series_1h.get(open_time_1h, btc_ret_1h)
+        rs_1h = round(coin_ret_1h - btc_matched_ret_1h, 2)
 
         # =========================================================================
         # 1. PERHITUNGAN SKOR V1 (LEGACY COMPOSITE - Disimpan untuk Validasi A/B)
@@ -539,15 +557,21 @@ def run_scanner(
 
         flow_score = max(0, min(DEFAULT_WEIGHTS["flow"], flow_score))
 
-        # --- PILAR 4: DERIVATIF & SHORT SQUEEZE (Maksimal 15 Poin) ---
+        # --- PILAR 4: DERIVATIF & DINAMIKA OI (Maksimal 15 Poin) ---
         derivative_score = 0
-        if funding_rate <= -0.10:
+        if funding_rate <= -0.05 or (funding_rate <= -0.015 and delta_oi_1h > 0):
             derivative_score += 12
-            signals.append(f"EXTREME_SHORT_SQUEEZE (FR: {funding_rate:+.3f}%)")
-        elif funding_rate <= -0.02:
+            signals.append(f"EXTREME_SHORT_SQUEEZE (FR:{funding_rate:+.3f}%, ΔOI:+${delta_oi_1h}M)")
+        elif funding_rate <= -0.015:
             derivative_score += 8
-            signals.append(f"POTENSI_SHORT_SQUEEZE (FR: {funding_rate:+.3f}%)")
-        elif funding_rate >= +0.05:
+            signals.append(f"POTENSI_SHORT_SQUEEZE (FR:{funding_rate:+.3f}%)")
+        elif delta_funding_1h < -0.003 and delta_oi_1h > 0:
+            derivative_score += 6
+            signals.append(f"SHORT_BUILDUP (ΔFR:{delta_funding_1h:+.3f}%, ΔOI:+${delta_oi_1h}M)")
+        elif delta_oi_1h > 0.5 and roc_1h > 0.5:
+            derivative_score += 5
+            signals.append(f"LONG_INFLOW (ΔOI:+${delta_oi_1h}M)")
+        elif funding_rate >= +0.05 or (funding_rate >= +0.03 and delta_oi_1h < -0.5):
             derivative_score -= 8
             signals.append("RISIKO_LONG_DUMP (Hindari Beli Pucuk)")
 
@@ -607,6 +631,7 @@ def run_scanner(
             atr_expansion=atr_exp,
             roc_1h=roc_1h,
             rs_1h=rs_1h,
+            vol_ratio_4h=vol_ratio,
             is_overextended=is_overextended
         )
         for stg in status_tags:
@@ -678,6 +703,9 @@ def run_scanner(
             "flow_score": int(flow_score),
             "derivative_score": int(derivative_score),
             "macro_score": int(macro_score),
+            "delta_oi_1h": delta_oi_1h,
+            "delta_oi_4h": delta_oi_4h,
+            "delta_funding_1h": delta_funding_1h,
             "roc_1h": round(roc_1h, 2),
             "acceleration_1h": round(accel_1h, 2),
             "atr_expansion": round(atr_exp, 2),

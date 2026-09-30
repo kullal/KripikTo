@@ -268,17 +268,21 @@ def fetch_subsequent_klines(
     return []
 
 
+TIME_STOP_HOURS = 6.0  # Sesuai spesifikasi Fase 3.6 (Momentum Scalping Time Stop)
+
+
 def evaluate_single_signal(
     signal: Dict[str, Any],
     sim_interval: str = "1h",
     fill_timeout_hours: int = 24,
-    trade_timeout_hours: int = 48
+    trade_timeout_hours: float = TIME_STOP_HOURS
 ) -> Dict[str, Any]:
     """
     Merekonstruksi pergerakan harga historis sejak waktu scan:
     1. Fase Limit Order: Cek apakah Low menyentuh buy_high (order terisi).
-    2. Fase Aktif: Hitung MFE, MAE, deteksi TP1/TP2 vs SL (konservatif jika keduanya tersentuh di lilin sama).
-    3. Fase Timeout: Keluar jika melebihi batas waktu (mencegah modal tersandera koin sideways).
+    2. Fase Aktif: Hitung MFE, MAE, deteksi TP1/TP2 vs SL (kronologis lilin per lilin).
+    3. Fase Ambiguous: Jika TP dan SL tersentuh di lilin yang sama -> AMBIGUOUS (tanpa mengarang urutan).
+    4. Fase Timeout: Keluar jika melebihi Time-Stop 6 jam (mencegah modal tersandera koin sideways).
     """
     scan_t_str = signal["scan_time"]
     sym = signal["symbol"]
@@ -378,13 +382,9 @@ def evaluate_single_signal(
             hit_tp2 = (tp2 > 0 and c_high >= tp2)
             hit_sl = (sl > 0 and c_low <= sl)
 
-            # Jika terjadi flash spike dua arah di lilin yang sama (konservatif: anggap SL lebih dulu)
+            # Jika terjadi flash spike dua arah di lilin yang sama (Spesifikasi 3.5: AMBIGUOUS, jangan mengarang urutan)
             if hit_tp1 and hit_sl:
-                if c_open >= fill_price:
-                    # Buka di atas, asumsikan turun kena SL dulu
-                    result = "SL_HIT"
-                else:
-                    result = "SL_HIT"
+                result = "AMBIGUOUS"
                 result_time = c["datetime_utc"]
                 dur_hours = round(elapsed_from_fill, 1)
                 dur_candles = idx - (fill_candle_idx if fill_candle_idx >= 0 else 0)

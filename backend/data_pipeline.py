@@ -407,23 +407,26 @@ def fetch_btc_benchmark(
 def get_btc_benchmark(db_path: str = DB_PATH) -> Dict[str, Any]:
     """
     Membaca data lilin tertutup terakhir BTCUSDT untuk menghitung return 4h dan 1h BTC.
-    Digunakan untuk mengukur Relative Strength (RS_4H dan RS_1H) terhadap altcoin.
+    Menyimpan open_time dan close_time agar penghitungan Relative Strength (RS)
+    dapat diverifikasi secara ketat (timestamp-aligned).
     """
     res = {
         "btc_price": 0.0,
         "btc_return_4h": 0.0,
         "btc_return_1h": 0.0,
         "btc_candle_time_4h": "",
-        "btc_candle_time_1h": ""
+        "btc_candle_time_1h": "",
+        "btc_open_time_4h": 0,
+        "btc_open_time_1h": 0
     }
     with sqlite3.connect(db_path) as conn:
         cursor = conn.cursor()
-        for iv, key_ret, key_time in [
-            ("4h", "btc_return_4h", "btc_candle_time_4h"),
-            ("1h", "btc_return_1h", "btc_candle_time_1h")
+        for iv, key_ret, key_time, key_open in [
+            ("4h", "btc_return_4h", "btc_candle_time_4h", "btc_open_time_4h"),
+            ("1h", "btc_return_1h", "btc_candle_time_1h", "btc_open_time_1h")
         ]:
             cursor.execute("""
-                SELECT close, datetime_utc
+                SELECT close, datetime_utc, open_time
                 FROM klines_history
                 WHERE symbol = 'BTCUSDT' AND interval = ? AND (is_closed = 1 OR is_closed IS NULL)
                 ORDER BY open_time DESC
@@ -435,13 +438,42 @@ def get_btc_benchmark(db_path: str = DB_PATH) -> Dict[str, Any]:
                 prev_close = float(rows[1][0])
                 res["btc_price"] = latest_close
                 res[key_time] = rows[0][1]
+                res[key_open] = int(rows[0][2])
                 if prev_close > 0:
                     res[key_ret] = round(((latest_close - prev_close) / prev_close) * 100.0, 2)
             elif len(rows) == 1:
                 res["btc_price"] = float(rows[0][0])
                 res[key_time] = rows[0][1]
+                res[key_open] = int(rows[0][2])
 
     return res
+
+
+def get_btc_benchmark_time_series(interval: str = "4h", db_path: str = DB_PATH) -> Dict[int, float]:
+    """
+    Mengambil mapping time-series lilin tertutup BTCUSDT: {open_time_ms: return_pct}.
+    Memastikan setiap koin dibandingkan dengan lilin BTC yang persis sama open_time-nya.
+    """
+    series_map = {}
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT open_time, close
+            FROM klines_history
+            WHERE symbol = 'BTCUSDT' AND interval = ? AND (is_closed = 1 OR is_closed IS NULL)
+            ORDER BY open_time ASC
+        """, (interval,))
+        rows = cursor.fetchall()
+
+    for i in range(1, len(rows)):
+        prev_close = float(rows[i - 1][1])
+        cur_open_time = int(rows[i][0])
+        cur_close = float(rows[i][1])
+        if prev_close > 0:
+            ret = round(((cur_close - prev_close) / prev_close) * 100.0, 2)
+            series_map[cur_open_time] = ret
+
+    return series_map
 
 
 def fetch_mtf_klines_batch(

@@ -126,7 +126,8 @@ def extract_1h_momentum_features(
             "atr_1h": atr_v,
             "atr_expansion_ratio": round(atr_exp, 2),
             "vol_ratio_1h": round(vol_r, 2),
-            "rs_1h": rs_1h
+            "rs_1h": rs_1h,
+            "open_time_1h": int(row["open_time"]) if "open_time" in row else 0
         }
 
     return feature_map
@@ -139,35 +140,38 @@ def classify_setup_and_status(
     atr_expansion: float,
     roc_1h: float,
     rs_1h: float,
+    vol_ratio_4h: float = 1.0,
     is_overextended: bool = False
 ) -> Tuple[str, str, List[str]]:
     """
-    Memisahkan Taksonomi Sinyal secara Jujur:
-    - ACCUMULATION_COIL: Paus borong, struktur bagus, tapi momentum tidur -> STATUS: WAIT
-    - MOMENTUM_RUNNER: Struktur bagus, akselerasi kinetik meledak -> STATUS: READY
-    - VOLATILITY_SQUEEZE: Volatilitas tertekan rapat, tunggu penembusan -> STATUS: WAIT
+    Memisahkan Taksonomi Sinyal sesuai Spesifikasi Desain KripikTo v2 (Fase 5):
+    - ACCUMULATION_COIL: Structure >= 18, Flow >= 14, Momentum < 12 (STATUS: WAIT)
+    - MOMENTUM_RUNNER: Structure >= 18, Momentum >= 22, Flow >= 14 (STATUS: READY / EXTENDED)
+    - VOLATILITY_SQUEEZE: ATR expansion < 0.85 DAN Volume Kering <= 0.80x (STATUS: WAIT)
+    - STRUCTURE_BULLISH: Structure >= 15 (Tren sehat tetapi belum runner)
     - NO_SETUP: Kondisi lemah
     """
     tags = []
 
-    # 1. Deteksi SETUP TYPE
-    if structure_score >= 15 and flow_score >= 12 and momentum_score < 14:
-        # Kasus PARTI: Akumulasi kuat tetapi kinetik belum bergerak
+    # 1. Deteksi SETUP TYPE Berdasarkan Definisi Spesifikasi
+    if structure_score >= 18 and flow_score >= 14 and momentum_score < 12:
+        # Kasus PARTI: Akumulasi paus kuat tetapi momentum kinetik belum berkembang
         setup_type = "ACCUMULATION_COIL"
         tags.append("PAUS_NYICIL_DIAM (Harga Belum Gerak)")
-    elif structure_score >= 16 and momentum_score >= 16:
-        # Momentum Runner: Struktur dan akselerasi sejalan
+    elif structure_score >= 18 and momentum_score >= 22 and flow_score >= 14:
+        # Momentum Runner: Struktur, aliran paus, dan kinetik momentum akselerasi sejalan
         setup_type = "MOMENTUM_RUNNER"
-        tags.append("MOMENTUM_EXPANDING (Akselerasi Positif)")
-    elif atr_expansion < 0.85 and structure_score >= 14:
+        tags.append("MOMENTUM_RUNNER (Akselerasi Kinetik Positif)")
+    elif atr_expansion < 0.85 and vol_ratio_4h <= 0.80 and structure_score >= 14:
+        # Volatility Squeeze Sejati: Pita volatilitas menyempit DAN volume perdagangan kering
         setup_type = "VOLATILITY_SQUEEZE"
-        tags.append("VOLATILITY_SQUEEZE (Pita Menyempit)")
+        tags.append("VOLATILITY_SQUEEZE (Pita Menyempit + Volume Kering)")
     elif structure_score >= 15:
         setup_type = "STRUCTURE_BULLISH"
     else:
         setup_type = "NO_SETUP"
 
-    # 2. Deteksi ENTRY STATUS
+    # 2. Deteksi ENTRY STATUS (Prinsip: WAIT != BUY, READY != BUY, EXTENDED != BUY)
     if setup_type == "MOMENTUM_RUNNER":
         if is_overextended:
             entry_status = "EXTENDED"

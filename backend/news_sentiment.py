@@ -277,15 +277,42 @@ Kembalikan jawaban HANYA berupa JSON valid dengan skema berikut:
     }
 
 
-def calculate_composite_score(tech_score: int, sentiment_score: float, crypto_risk: bool = False) -> int:
+def calculate_news_pillar_score(sentiment_score: float) -> int:
     """
-    Menghitung skor gabungan akhir:
-    - 70% Bobot Teknikal & Whale Flow (0 - 100)
-    - 30% Bobot Sentimen Berita AI (-1.0 s.d +1.0 dinormalisasi ke 0 - 100)
-    - Pinalti keras jika terdeteksi risiko keamanan/exploit/delisting (maksimal skor 35)
+    Menghitung Skor Pilar ke-5 (AI News Sentiment - Maksimal 10 Poin):
+    Sesuai arsitektur 5 pilar KripikTo v2:
+    Structure: 25 | Momentum: 30 | Flow: 20 | Derivatives: 15 | AI News: 10 = Total 100
+    - sentiment_score rentang -1.0 s.d +1.0:
+      * >= +0.6 (Strong Bullish) -> 10 poin
+      * +0.2 s.d +0.5 (Bullish)  -> 8 poin
+      * -0.1 s.d +0.1 (Neutral)  -> 5 poin
+      * -0.5 s.d -0.2 (Bearish)  -> 2 poin
+      * < -0.5 (Strong Bearish)  -> 0 poin
     """
-    normalized_news = (sentiment_score + 1.0) / 2.0 * 100  # -1.0 -> 0, 0.0 -> 50, +1.0 -> 100
-    final_score = int(round(tech_score * 0.70 + normalized_news * 0.30))
+    if sentiment_score >= 0.6:
+        return 10
+    elif sentiment_score >= 0.2:
+        return 8
+    elif sentiment_score >= -0.1:
+        return 5
+    elif sentiment_score >= -0.5:
+        return 2
+    else:
+        return 0
+
+
+def calculate_unified_v2_final_score(
+    v2_score: int,
+    sentiment_score: float,
+    crypto_risk: bool = False
+) -> int:
+    """
+    Menyatukan skor kuantitatif v2 (maksimal 90 dari Pilar 1-4 + Makro baseline)
+    dengan Pilar ke-5 AI News (0 - 10 poin) ke dalam basis 100 poin tunggal yang konsisten.
+    Crypto Risk Guard: Hard safety override membatasi maksimal 35 jika ada risiko fatal.
+    """
+    news_pts = calculate_news_pillar_score(sentiment_score)
+    final_score = min(100, v2_score + news_pts)
     if crypto_risk:
         final_score = min(final_score, 35)
     return max(0, min(100, final_score))
@@ -294,25 +321,53 @@ def calculate_composite_score(tech_score: int, sentiment_score: float, crypto_ri
 def get_recommendation_label(
     final_score: int,
     sentiment: str,
-    tech_score: int,
+    v2_score: int,
     crypto_risk: bool = False,
     entry_status: str = "WAIT",
     setup_type: str = "NO_SETUP"
 ) -> str:
-    """Menentukan label rekomendasi berdasarkan skor gabungan, status trigger 15M, dan pengaman risiko."""
+    """
+    Menentukan label rekomendasi berdasarkan gerbang taksonomi status entri (Fase 5):
+    PRINSIP UTAMA:
+    - WAIT != BUY
+    - READY != BUY
+    - EXTENDED != BUY
+    Hanya status 'TRIGGERED' yang boleh menghasilkan sinyal beli (BUY)!
+    Skor tinggi tanpa pemicu taktis 15M hanya masuk status READY/WATCHLIST.
+    """
+    # 1. Hard Safety Override (Crypto Risk Guard)
     if crypto_risk:
         return "⚠️ AVOID (Hack / Exploit / Delisting Risk)"
-    elif tech_score >= 75 and sentiment == "BEARISH":
+
+    # 2. Bad News Divergence
+    if v2_score >= 70 and sentiment == "BEARISH":
         return "⚠️ CAUTION (Bad News Divergence)"
-    elif entry_status == "TRIGGERED":
-        return "🎯 TRIGGERED_BUY (15M Valid)"
-    elif setup_type == "ACCUMULATION_COIL":
-        return "⏳ ACCUMULATION (Paus Diam)"
-    elif final_score >= 80:
-        return "🚀 STRONG_BUY (Paus + Katalis Bullish)"
-    elif final_score >= 65:
-        return "✅ BUY_MOMENTUM (Akumulasi Sehat)"
-    elif final_score >= 50:
+
+    # 3. Gerbang Eksekusi 15M (Triggered)
+    if entry_status == "TRIGGERED":
+        if setup_type == "MOMENTUM_RUNNER":
+            return "🚀 STRONG_BUY (15M Breakout Triggered)"
+        else:
+            return "🎯 TRIGGERED_BUY (15M Trigger Valid)"
+
+    # 4. Peringatan Pucuk (Extended)
+    if entry_status == "EXTENDED":
+        return "⚠️ OVEREXTENDED (Tunggu Pullback / Jangan Beli Pucuk)"
+
+    # 5. Setup Batal (Failed)
+    if entry_status == "FAILED":
+        return "❌ SETUP_FAILED (Breakdown di Bawah Support)"
+
+    # 6. Momentum Runner Siap Pemicu (Ready)
+    if entry_status == "READY":
+        return "👀 READY_WATCHLIST (Menunggu 15M Trigger - Jangan Beli Dulu)"
+
+    # 7. Status Konsolidasi / Akumulasi (Wait)
+    if setup_type == "ACCUMULATION_COIL":
+        return "⏳ ACCUMULATION (Paus Diam - Masuk Watchlist)"
+    elif setup_type == "VOLATILITY_SQUEEZE":
+        return "⏳ SQUEEZE_WAIT (Tunggu Ekspansi Volatilitas)"
+    elif final_score >= 60:
         return "👀 WATCHLIST (Pantau Support)"
     else:
         return "⏳ NEUTRAL / WAIT"
@@ -389,9 +444,9 @@ def run_news_sentiment_pipeline(
         setup_type = str(item.get("setup_type", "NO_SETUP"))
         entry_status = str(item.get("entry_status", "WAIT"))
 
-        final_score = calculate_composite_score(tech_score, sent_score, crypto_risk)
+        final_score = calculate_unified_v2_final_score(v2_score, sent_score, crypto_risk)
         recom = get_recommendation_label(
-            final_score, sentiment, tech_score, crypto_risk,
+            final_score, sentiment, v2_score, crypto_risk,
             entry_status=entry_status, setup_type=setup_type
         )
 
