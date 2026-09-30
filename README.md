@@ -7,6 +7,33 @@ Jalankan tes regresi indikator lokal dengan `python -m unittest discover -s test
 Hasil scan historis tetap menyimpan nilai indikator saat scan tersebut dibuat; perbaikan
 berlaku pada scan berikutnya.
 
+Gerbang entry memprioritaskan `EXTENDED`/`FAILED` sebelum trigger 15M. Lonjakan
+candle 15M >=4% tetap `EXTENDED`, dan trigger mikro tidak membatalkan status
+`EXTENDED` dari struktur timeframe besar dalam scan yang sama.
+`stop_loss_pct` adalah batas kerugian maksimum: SL support/ATR dibatasi nilai
+konfigurasi tersebut, dengan pembulatan harga yang menjaga batas risiko.
+Outcome tracker mengevaluasi limit pada `entry_price` eksplisit (atau titik tengah
+buy area untuk data lama), hanya mencatat fill ketika low/high candle mencakup
+harga itu. Fill yang berbenturan dengan TP/SL dalam satu candle menjadi `AMBIGUOUS`.
+Evaluasi direkonstruksi dari waktu scan dan memakai time-stop default 6 jam.
+Timestamp fill/exit dari OHLC memiliki resolusi candle, bukan waktu transaksi aktual.
+
+Scanner memvalidasi 51 candle struktur, 35 candle momentum 1H, dan 21 candle
+trigger 15M terbaru. Candle harus memiliki `is_closed=1`, metadata waktu lengkap,
+OHLC/volume valid, dan urutan tanpa duplikasi atau jeda. Umur candle terakhir dan
+pengambilannya dibatasi satu interval + toleransi 60 detik; snapshot ticker 24 jam
+harus diambil dalam 1 jam + 60 detik. `--skip-download` tetap melewati pemeriksaan ini.
+Data historis tetap tersimpan; metadata lama yang tidak diketahui tidak dianggap
+valid secara otomatis dan perlu diperbarui lewat unduhan berikutnya.
+
+Relative strength membandingkan return koin dan BTC pada interval yang diminta,
+dengan batas waktu candle sekarang dan sebelumnya yang sama persis. Benchmark
+yang hilang ditampilkan `N/A`, disimpan sebagai SQL `NULL` / JSON `null`, dan
+tidak diganti return BTC nol. Kolom `rs_structure` berlaku pada semua interval;
+kolom kompatibilitas `rs_4h` hanya terisi untuk scan 4H. Kekurangan data momentum,
+benchmark, atau trigger membuat kandidat `PARTIAL` dan memblokir entry baru.
+Alasan penolakan tersimpan di `backend/data/data_quality_latest.json`.
+
 Sistem pemindai pasar aset kripto otomatis berbasis kombinasi data **Kuantitatif (Candlestick Klines + Whale Flow / Bandarmologi Paus)** dan **Kualitatif (Analisis Sentimen Berita Global dengan Google Gemini Flash LLM + Crypto Risk Guard)**.
 
 ---

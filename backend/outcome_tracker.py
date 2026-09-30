@@ -283,7 +283,7 @@ def evaluate_single_signal(
 ) -> Dict[str, Any]:
     """
     Merekonstruksi pergerakan harga historis sejak waktu scan:
-    1. Fase Limit Order: Cek apakah Low menyentuh buy_high (order terisi).
+    1. Fase Limit Order: Entry eksplisit harus berada di rentang low/high candle.
     2. Fase Aktif: Hitung MFE, MAE, deteksi TP1/TP2 vs SL (kronologis lilin per lilin).
     3. Fase Ambiguous: Jika TP dan SL tersentuh di lilin yang sama -> AMBIGUOUS (tanpa mengarang urutan).
     4. Fase Timeout: Keluar jika melebihi Time-Stop 6 jam (mencegah modal tersandera koin sideways).
@@ -308,30 +308,31 @@ def evaluate_single_signal(
     if not klines:
         return signal
 
-    is_filled = int(signal.get("is_filled") or 0)
-    fill_time_str = signal.get("fill_time") or ""
-    fill_price = float(signal.get("fill_price") or entry_p or 0.0)
+    # Replay from scan time on every evaluation. Previous partial results must
+    # not treat candles before the fill as an already active position.
+    is_filled = 0
+    fill_time_str = ""
+    fill_price = 0.0
     fill_dt = None
-    if fill_time_str:
-        try:
-            fill_dt = datetime.datetime.strptime(fill_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=datetime.timezone.utc)
-        except Exception:
-            pass
-
-    mfe_pct = float(signal.get("mfe_pct") or 0.0)
-    mae_pct = float(signal.get("mae_pct") or 0.0)
+    mfe_pct = 0.0
+    mae_pct = 0.0
     result = "PENDING"
     result_time = ""
     dur_hours = 0.0
     dur_candles = 0
 
-    ret_12h = signal.get("return_12h_pct")
-    ret_24h = signal.get("return_24h_pct")
-    ret_48h = signal.get("return_48h_pct")
+    ret_12h = None
+    ret_24h = None
+    ret_48h = None
 
-    # Jika batas buy belum ditentukan jelas, gunakan entry_price
-    if buy_high <= 0:
-        buy_high = entry_p if entry_p > 0 else float(klines[0]["open"])
+    # Legacy signals may omit entry_price; use the declared buy area only.
+    if entry_p <= 0:
+        if 0 < buy_low <= buy_high:
+            entry_p = (buy_low + buy_high) / 2.0
+        else:
+            entry_p = buy_high if buy_high > 0 else buy_low
+    if entry_p <= 0:
+        return signal
 
     fill_candle_idx = -1
 
@@ -341,14 +342,22 @@ def evaluate_single_signal(
         c_low = c["low"]
         c_close = c["close"]
         c_open = c["open"]
+        if c_dt < dt_scan:
+            continue
 
         # --- TAHAP 1: MENUNGGU LIMIT ORDER TERISI (FILL) ---
         if not is_filled:
-            # Order terisi jika harga Low lilin menembus batas atas area beli
-            if c_low <= buy_high:
+            elapsed_since_scan = (c_dt - dt_scan).total_seconds() / 3600.0
+            if elapsed_since_scan >= fill_timeout_hours:
+                result = "UNFILLED"
+                result_time = c["datetime_utc"]
+                break
+            # Require evidence that the declared limit price was touched.
+            # OHLC alone does not prove a fill at that price across a gap.
+            if c_low <= entry_p <= c_high:
                 is_filled = 1
                 # Use the scanner's declared entry price. Do not infer an intrabar fill price.
-                fill_price = entry_p if entry_p > 0 else buy_high
+                fill_price = entry_p
                 fill_time_str = c["datetime_utc"]
                 fill_dt = c_dt
                 fill_candle_idx = idx
@@ -357,7 +366,7 @@ def evaluate_single_signal(
                 # Mark the event ambiguous instead of inventing the intrabar order.
                 same_candle_tp = (tp1 > 0 and c_high >= tp1) or (tp2 > 0 and c_high >= tp2)
                 same_candle_sl = sl > 0 and c_low <= sl
-                if same_candle_tp and same_candle_sl:
+                if same_candle_tp or same_candle_sl:
                     result = "AMBIGUOUS"
                     result_time = c["datetime_utc"]
                     dur_hours = 0.0
@@ -368,16 +377,19 @@ def evaluate_single_signal(
                 # MFE/MAE/TP/SL evaluation starts on the next closed candle.
                 continue
             else:
-                elapsed_since_scan = (c_dt - dt_scan).total_seconds() / 3600.0
-                if elapsed_since_scan >= fill_timeout_hours:
-                    result = "UNFILLED"
-                    result_time = c["datetime_utc"]
-                    break
                 continue
 
         # --- TAHAP 2: TRADE AKTIF SETELAH TERISI (IN POSITION) ---
         if is_filled and fill_price > 0:
             elapsed_from_fill = (c_dt - fill_dt).total_seconds() / 3600.0 if fill_dt else 0.0
+            # A candle starting at the deadline is outside the trade window.
+            # Its later high/low cannot count as a TP/SL within that window.
+            if elapsed_from_fill >= trade_timeout_hours:
+                result = "TIMEOUT"
+                result_time = c["datetime_utc"]
+                dur_hours = round(elapsed_from_fill, 1)
+                dur_candles = idx - (fill_candle_idx if fill_candle_idx >= 0 else 0)
+                break
             
             # Hitung MFE (% Keuntungan Maksimal yang sempat tersentuh)
             cur_gain = ((c_high - fill_price) / fill_price) * 100.0
@@ -403,7 +415,7 @@ def evaluate_single_signal(
             hit_sl = (sl > 0 and c_low <= sl)
 
             # Jika terjadi flash spike dua arah di lilin yang sama (Spesifikasi 3.5: AMBIGUOUS, jangan mengarang urutan)
-            if hit_tp1 and hit_sl:
+            if (hit_tp1 or hit_tp2) and hit_sl:
                 result = "AMBIGUOUS"
                 result_time = c["datetime_utc"]
                 dur_hours = round(elapsed_from_fill, 1)
@@ -423,14 +435,6 @@ def evaluate_single_signal(
                 break
             elif hit_sl:
                 result = "SL_HIT"
-                result_time = c["datetime_utc"]
-                dur_hours = round(elapsed_from_fill, 1)
-                dur_candles = idx - (fill_candle_idx if fill_candle_idx >= 0 else 0)
-                break
-
-            # Cek Time-Stop (Posisi Sideways tanpa kejelasan arah)
-            if elapsed_from_fill >= trade_timeout_hours:
-                result = "TIMEOUT"
                 result_time = c["datetime_utc"]
                 dur_hours = round(elapsed_from_fill, 1)
                 dur_candles = idx - (fill_candle_idx if fill_candle_idx >= 0 else 0)
@@ -457,7 +461,7 @@ def evaluate_single_signal(
 
 
 def run_outcome_tracker(
-    timeout_hours: int = 48,
+    timeout_hours: float = TIME_STOP_HOURS,
     force_recheck: bool = False,
     db_path: str = DB_PATH
 ) -> pd.DataFrame:
@@ -620,7 +624,7 @@ def print_outcome_scoreboard(df: pd.DataFrame) -> None:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="KripikTo Outcome Tracker: Empirical Performance Engine")
-    parser.add_argument("--timeout", type=int, default=48, help="Batas jam timeout posisi sideways (default: 48 jam)")
+    parser.add_argument("--timeout", type=float, default=TIME_STOP_HOURS, help="Batas jam timeout posisi sideways (default: 6 jam)")
     parser.add_argument("--recheck", action="store_true", help="Evaluasi ulang seluruh riwayat sinyal dari nol")
     args = parser.parse_args()
 

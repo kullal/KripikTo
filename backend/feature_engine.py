@@ -23,6 +23,11 @@ from typing import Dict, List, Any, Tuple, Optional
 import pandas as pd
 import numpy as np
 
+try:
+    from backend.data_integrity import aligned_relative_strength
+except ImportError:
+    from data_integrity import aligned_relative_strength
+
 
 CONFIG_PATH = Path(__file__).resolve().parent / "data" / "calibrated_config.json"
 
@@ -76,7 +81,7 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 def extract_1h_momentum_features(
     df_1h: pd.DataFrame,
-    btc_ret_1h: float = 0.0
+    btc_returns: Optional[Dict[tuple, float]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Mengekstraksi fitur momentum kinetik dari data lilin 1H tertutup:
@@ -92,6 +97,8 @@ def extract_1h_momentum_features(
     df = df_1h.copy()
     df["prev_close"] = df.groupby("symbol")["close"].shift(1)
     df["prev_close_2"] = df.groupby("symbol")["close"].shift(2)
+    df["prev_open_time"] = df.groupby("symbol")["open_time"].shift(1)
+    df["prev_close_time"] = df.groupby("symbol")["close_time"].shift(1)
     df["roc_1h"] = ((df["close"] - df["prev_close"]) / df["prev_close"].replace(0, np.nan)) * 100.0
     df["roc_prev_1h"] = ((df["prev_close"] - df["prev_close_2"]) / df["prev_close_2"].replace(0, np.nan)) * 100.0
     df["acceleration_1h"] = df["roc_1h"] - df["roc_prev_1h"]
@@ -106,7 +113,7 @@ def extract_1h_momentum_features(
     df["vol_ratio_1h"] = df["volume"] / df["vol_ma20_1h"].replace(0, np.nan)
 
     # Ambil baris tertutup terakhir per simbol
-    latest_1h = df.groupby("symbol").last().reset_index()
+    latest_1h = df.groupby("symbol", sort=False).tail(1).reset_index(drop=True)
 
     feature_map = {}
     for _, row in latest_1h.iterrows():
@@ -119,7 +126,9 @@ def extract_1h_momentum_features(
         close_p = float(row["close"])
 
         # RS 1H vs BTC
-        rs_1h = round(roc - btc_ret_1h, 2)
+        rs_1h, btc_matched, rs_status = aligned_relative_strength(
+            row, btc_returns or {}, float(row["roc_1h"]),
+        )
 
         feature_map[sym] = {
             "close_1h": close_p,
@@ -129,7 +138,10 @@ def extract_1h_momentum_features(
             "atr_expansion_ratio": round(atr_exp, 2),
             "vol_ratio_1h": round(vol_r, 2),
             "rs_1h": rs_1h,
-            "open_time_1h": int(row["open_time"]) if "open_time" in row else 0
+            "rs_1h_status": rs_status,
+            "btc_return_1h": btc_matched,
+            "open_time_1h": int(row["open_time"]),
+            "close_time_1h": int(row["close_time"]),
         }
 
     return feature_map
@@ -178,13 +190,12 @@ def classify_setup_and_status(
         setup_type = "NO_SETUP"
 
     # 2. Deteksi ENTRY STATUS (Prinsip: WAIT != BUY, READY != BUY, EXTENDED != BUY)
-    if setup_type == "MOMENTUM_RUNNER":
-        if is_overextended:
-            entry_status = "EXTENDED"
-            tags.append("⚠️ JANGAN_KEJAR (Tunggu Retest)")
-        else:
-            entry_status = "READY"
-            tags.append("🚀 READY (Menunggu 15M Trigger)")
+    if is_overextended:
+        entry_status = "EXTENDED"
+        tags.append("⚠️ JANGAN_KEJAR (Tunggu Retest)")
+    elif setup_type == "MOMENTUM_RUNNER":
+        entry_status = "READY"
+        tags.append("🚀 READY (Menunggu 15M Trigger)")
     elif setup_type == "ACCUMULATION_COIL":
         entry_status = "WAIT"
         tags.append("⏳ WAIT (Masuk Watchlist, Jangan Beli Sekarang)")
@@ -210,7 +221,7 @@ def calculate_dynamic_tp_sl(
     Menghitung TP & SL Dinamis Berbasis ATR & Support Struktural:
     - TP1: Berdasarkan target kalibrasi empiris (default ~1.8x ATR atau min +4.2% s.d +5.5%)
     - TP2: Berdasarkan 3.0x ATR (runner target)
-    - SL : Berdasarkan Support struktural & toleransi kalibrasi (1.2x s.d 1.5x ATR, aman dari MAE -2.78%)
+    - SL : Support/ATR dibatasi risiko maksimum stop_loss_pct dari konfigurasi.
     """
     if entry_price <= 0:
         entry_price = 1e-8
@@ -221,11 +232,18 @@ def calculate_dynamic_tp_sl(
     tp_mult = float(cfg.get("tp_atr_multiplier", 1.6))
     sl_mult = float(cfg.get("sl_atr_multiplier", 1.25))
 
-    # 1. Stop Loss: Gabungkan Support Struktural dan Toleransi ATR
-    # Sesuai data Outcome Tracker: MAE rata-rata -2.78%, jadi SL aman di rentang -4.2% s.d -5.5%
+    if not math.isfinite(target_sl_pct) or not 0 < target_sl_pct < 100:
+        raise ValueError("stop_loss_pct harus memiliki magnitudo antara 0 dan 100.")
+
+    # stop_loss_pct is a maximum loss distance, not a mandatory exact stop.
     structural_sl = min(support_level * 0.990, entry_price - (sl_mult * atr_val))
     max_sl_price = entry_price * (1.0 - (target_sl_pct / 100.0))
-    sl_price = round(min(entry_price * 0.965, max(entry_price * 0.940, structural_sl)), dec)
+    # Round the risk floor upward so price precision cannot exceed the risk cap.
+    price_scale = 10 ** dec
+    risk_floor = math.ceil(max_sl_price * price_scale) / price_scale
+    sl_price = max(round(structural_sl, dec), risk_floor)
+    if not 0 < sl_price < entry_price:
+        raise ValueError("Presisi harga atau parameter SL tidak menghasilkan stop di bawah entry.")
     sl_pct = round(((sl_price - entry_price) / entry_price) * 100.0, 2)
 
     # 2. Take Profit 1: Minimal target kalibrasi atau tp_mult * ATR
@@ -259,7 +277,7 @@ def evaluate_15m_trigger(
     Mendeteksi titik eksekusi mikro yang presisi:
     1. BREAKOUT_TRIGGER: Close > 20-bar 15M High + Volume 15M Spike >= 1.25x + RSI < 78.
     2. RETEST_TRIGGER: Harga mengetes MA20 15M (jarak <= 0.8%) dengan pantulan bullish / lower-wick pinbar >= 35%.
-    3. OVERBOUGHT_WARNING: RSI 15M >= 78 atau lonjakan lilin tunggal > 4% -> STATUS: EXTENDED (Tunggu pullback).
+    3. OVERBOUGHT_WARNING: RSI 15M >= 78 atau lonjakan lilin tunggal >= 4% -> STATUS: EXTENDED (Tunggu pullback).
     4. BREAKDOWN_WARNING: Close < MA20 15M * 0.985 -> STATUS: FAILED (Gagal bertahan di mikro support).
     5. CONSOLIDATING: Bergerak di atas MA20 15M -> STATUS: WAIT (Menunggu pemicu breakout/retest).
     """
@@ -300,15 +318,7 @@ def evaluate_15m_trigger(
         is_breakdown = (close < ma20 * 0.985)
 
         tags = []
-        if is_breakout:
-            status = "TRIGGERED"
-            reason = f"🎯 15M_BREAKOUT_VOL (Vol: {vol_r:.1f}x, RSI: {rsi_val:.0f})"
-            tags.append("15M_BREAKOUT_CONFIRMED")
-        elif is_retest_bounce:
-            status = "TRIGGERED"
-            reason = f"🎯 15M_RETEST_BOUNCE (Dekat MA20, Wick: {int(lower_wick_ratio*100)}%)"
-            tags.append("15M_RETEST_BOUNCE_CONFIRMED")
-        elif is_overbought:
+        if is_overbought:
             status = "EXTENDED"
             reason = f"⚠️ 15M_OVERBOUGHT (RSI: {rsi_val:.0f}, Tunggu Pullback)"
             tags.append("15M_OVERBOUGHT")
@@ -316,6 +326,14 @@ def evaluate_15m_trigger(
             status = "FAILED"
             reason = f"❌ 15M_BREAKDOWN (Jatuh di Bawah MA20 15M)"
             tags.append("15M_BREAKDOWN")
+        elif is_breakout:
+            status = "TRIGGERED"
+            reason = f"🎯 15M_BREAKOUT_VOL (Vol: {vol_r:.1f}x, RSI: {rsi_val:.0f})"
+            tags.append("15M_BREAKOUT_CONFIRMED")
+        elif is_retest_bounce:
+            status = "TRIGGERED"
+            reason = f"🎯 15M_RETEST_BOUNCE (Dekat MA20, Wick: {int(lower_wick_ratio*100)}%)"
+            tags.append("15M_RETEST_BOUNCE_CONFIRMED")
         else:
             status = "WAIT"
             reason = f"⏳ 15M_KONSOLIDASI (RSI: {rsi_val:.0f}, Menunggu Pemicu)"

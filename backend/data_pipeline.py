@@ -10,12 +10,19 @@ Modul pengunduh data pasar Kripto (Tahap 1):
 
 import sys
 import sqlite3
+from contextlib import closing
 import datetime
+import math
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import requests
+
+try:
+    from backend.data_integrity import build_return_series, validate_closed_candles
+except ImportError:
+    from data_integrity import build_return_series, validate_closed_candles
 
 # Pastikan output utf-8 aman di terminal Windows
 if sys.platform == "win32" and sys.stdout.encoding.lower() != "utf-8":
@@ -109,7 +116,7 @@ def is_stablecoin_or_excluded(
 
 def init_db(db_path: str = DB_PATH) -> None:
     """Inisialisasi tabel SQLite untuk ringkasan 24h dan data klines."""
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         cursor = conn.cursor()
         
         # 1. Tabel Ringkasan Pasar 24 Jam & Whale Flow
@@ -145,7 +152,7 @@ def init_db(db_path: str = DB_PATH) -> None:
                 volume REAL,
                 quote_volume REAL,
                 taker_buy_volume REAL,
-                is_closed INTEGER DEFAULT 1,
+                is_closed INTEGER DEFAULT 0,
                 fetched_at TEXT,
                 PRIMARY KEY (symbol, interval, open_time)
             )
@@ -156,7 +163,7 @@ def init_db(db_path: str = DB_PATH) -> None:
         existing_cols = {col[1] for col in cursor.fetchall()}
         for col_name, col_def in [
             ("close_time", "INTEGER"),
-            ("is_closed", "INTEGER DEFAULT 1"),
+            ("is_closed", "INTEGER DEFAULT 0"),
             ("fetched_at", "TEXT")
         ]:
             if col_name not in existing_cols:
@@ -267,7 +274,7 @@ def fetch_24h_summary(top_n: int = 500, db_path: str = DB_PATH) -> pd.DataFrame:
     df_top = df.head(top_n).copy()
 
     # Simpan ke SQLite
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM market_summary_24h")
         insert_query = """
@@ -363,7 +370,7 @@ def fetch_klines_batch(
                 success_count += 1
 
     if all_rows:
-        with sqlite3.connect(db_path) as conn:
+        with closing(sqlite3.connect(db_path)) as conn:
             cursor = conn.cursor()
             cursor.executemany("""
                 INSERT OR REPLACE INTO klines_history (
@@ -390,7 +397,7 @@ def fetch_btc_benchmark(
     for iv in intervals:
         _rows = _fetch_single_kline("BTCUSDT", iv, limit=50)
         if _rows:
-            with sqlite3.connect(db_path) as conn:
+            with closing(sqlite3.connect(db_path)) as conn:
                 cursor = conn.cursor()
                 cursor.executemany("""
                     INSERT OR REPLACE INTO klines_history (
@@ -404,7 +411,7 @@ def fetch_btc_benchmark(
     return get_btc_benchmark(db_path)
 
 
-def get_btc_benchmark(db_path: str = DB_PATH) -> Dict[str, Any]:
+def get_btc_benchmark(db_path: str = DB_PATH, now_ms: Optional[int] = None) -> Dict[str, Any]:
     """
     Membaca data lilin tertutup terakhir BTCUSDT untuk menghitung return 4h dan 1h BTC.
     Menyimpan open_time dan close_time agar penghitungan Relative Strength (RS)
@@ -412,68 +419,58 @@ def get_btc_benchmark(db_path: str = DB_PATH) -> Dict[str, Any]:
     """
     res = {
         "btc_price": 0.0,
-        "btc_return_4h": 0.0,
-        "btc_return_1h": 0.0,
+        "btc_return_4h": None,
+        "btc_return_1h": None,
         "btc_candle_time_4h": "",
         "btc_candle_time_1h": "",
         "btc_open_time_4h": 0,
         "btc_open_time_1h": 0
     }
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         cursor = conn.cursor()
         for iv, key_ret, key_time, key_open in [
             ("4h", "btc_return_4h", "btc_candle_time_4h", "btc_open_time_4h"),
             ("1h", "btc_return_1h", "btc_candle_time_1h", "btc_open_time_1h")
         ]:
             cursor.execute("""
-                SELECT close, datetime_utc, open_time
+                SELECT *
                 FROM klines_history
-                WHERE symbol = 'BTCUSDT' AND interval = ? AND (is_closed = 1 OR is_closed IS NULL)
+                WHERE symbol = 'BTCUSDT' AND interval = ? AND is_closed = 1
                 ORDER BY open_time DESC
                 LIMIT 2
             """, (iv,))
-            rows = cursor.fetchall()
-            if len(rows) >= 2:
-                latest_close = float(rows[0][0])
-                prev_close = float(rows[1][0])
-                res["btc_price"] = latest_close
-                res[key_time] = rows[0][1]
-                res[key_open] = int(rows[0][2])
-                if prev_close > 0:
-                    res[key_ret] = round(((latest_close - prev_close) / prev_close) * 100.0, 2)
-            elif len(rows) == 1:
-                res["btc_price"] = float(rows[0][0])
-                res[key_time] = rows[0][1]
-                res[key_open] = int(rows[0][2])
+            frame = pd.DataFrame(cursor.fetchall(), columns=[c[0] for c in cursor.description])
+            clean, _ = validate_closed_candles(frame, iv, min_candles=2, now_ms=now_ms)
+            if not clean.empty:
+                latest = clean.iloc[-1]
+                returns = build_return_series(clean, iv)
+                res["btc_price"] = float(latest["close"])
+                res[key_time] = latest["datetime_utc"]
+                res[key_open] = int(latest["open_time"])
+                res[key_ret] = round(next(reversed(returns.values())), 2)
 
     return res
 
 
-def get_btc_benchmark_time_series(interval: str = "4h", db_path: str = DB_PATH) -> Dict[int, float]:
+def get_btc_benchmark_time_series(
+    interval: str = "4h", db_path: str = DB_PATH, now_ms: Optional[int] = None,
+    quality_issues: Optional[Dict[str, list]] = None,
+) -> Dict[tuple, float]:
     """
-    Mengambil mapping time-series lilin tertutup BTCUSDT: {open_time_ms: return_pct}.
-    Memastikan setiap koin dibandingkan dengan lilin BTC yang persis sama open_time-nya.
+    Mapping return BTC dengan batas candle saat ini dan sebelumnya.
+    Return hanya tersedia jika jendela BTC tertutup, utuh, dan segar.
     """
-    series_map = {}
-    with sqlite3.connect(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT open_time, close
+    with closing(sqlite3.connect(db_path)) as conn:
+        frame = pd.read_sql("""
+            SELECT *
             FROM klines_history
-            WHERE symbol = 'BTCUSDT' AND interval = ? AND (is_closed = 1 OR is_closed IS NULL)
-            ORDER BY open_time ASC
-        """, (interval,))
-        rows = cursor.fetchall()
-
-    for i in range(1, len(rows)):
-        prev_close = float(rows[i - 1][1])
-        cur_open_time = int(rows[i][0])
-        cur_close = float(rows[i][1])
-        if prev_close > 0:
-            ret = round(((cur_close - prev_close) / prev_close) * 100.0, 2)
-            series_map[cur_open_time] = ret
-
-    return series_map
+            WHERE symbol = 'BTCUSDT' AND interval = ? AND is_closed = 1
+            ORDER BY open_time DESC LIMIT 2
+        """, conn, params=(interval,))
+    clean, rejected = validate_closed_candles(frame, interval, min_candles=2, now_ms=now_ms)
+    if quality_issues is not None:
+        quality_issues.update(rejected or ({"BTCUSDT": ["MISSING_CANDLES"]} if clean.empty else {}))
+    return build_return_series(clean, interval) if not clean.empty else {}
 
 
 def fetch_mtf_klines_batch(
@@ -509,7 +506,7 @@ def fetch_mtf_klines_batch(
                 pass
 
     if all_rows:
-        with sqlite3.connect(db_path) as conn:
+        with closing(sqlite3.connect(db_path)) as conn:
             cursor = conn.cursor()
             cursor.executemany("""
                 INSERT OR REPLACE INTO klines_history (
@@ -538,7 +535,7 @@ def fetch_15m_trigger_batch(
     return fetch_klines_batch(symbols=symbols, interval="15m", limit=limit, max_workers=max_workers, db_path=db_path)
 
 
-def update_whale_flow_from_klines(interval: str = "2h", db_path: str = DB_PATH) -> None:
+def update_whale_flow_from_klines(interval: str = "2h", db_path: str = DB_PATH, now_ms: Optional[int] = None) -> None:
     """
     Menghitung Taker Buy Ratio (Whale Flow) 24 jam terakhir dan candle terakhir
     berdasarkan data candlestick klines yang telah tersimpan.
@@ -555,7 +552,7 @@ def update_whale_flow_from_klines(interval: str = "2h", db_path: str = DB_PATH) 
     else:
         candles_in_24h = 1
     
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         cursor = conn.cursor()
         # Ambil daftar simbol unik
         cursor.execute("SELECT DISTINCT symbol FROM klines_history WHERE interval = ?", (interval,))
@@ -564,16 +561,24 @@ def update_whale_flow_from_klines(interval: str = "2h", db_path: str = DB_PATH) 
         for sym in symbols:
             # Ambil N candle terakhir
             cursor.execute("""
-                SELECT quote_volume, taker_buy_volume
+                SELECT *
                 FROM klines_history
-                WHERE symbol = ? AND interval = ? AND (is_closed = 1 OR is_closed IS NULL)
+                WHERE symbol = ? AND interval = ? AND is_closed = 1
                 ORDER BY open_time DESC
                 LIMIT ?
             """, (sym, interval, candles_in_24h))
-            rows = cursor.fetchall()
-            if rows:
-                total_quote = sum(r[0] for r in rows)
-                total_taker = sum(r[1] for r in rows)
+            frame = pd.DataFrame(cursor.fetchall(), columns=[c[0] for c in cursor.description])
+            clean, _ = validate_closed_candles(frame, interval, candles_in_24h, now_ms=now_ms)
+            if not clean.empty:
+                volumes = clean[["quote_volume", "taker_buy_volume"]].apply(pd.to_numeric, errors="coerce")
+                if (not all(math.isfinite(value) for value in volumes.to_numpy().flat)
+                        or (volumes < 0).any().any()
+                        or (volumes["taker_buy_volume"] > volumes["quote_volume"]).any()):
+                    continue
+                total_quote = float(volumes["quote_volume"].sum())
+                total_taker = float(volumes["taker_buy_volume"].sum())
+                if total_quote <= 0:
+                    continue
                 ratio_24h = (total_taker / total_quote * 100.0) if total_quote > 0 else 50.0
                 cursor.execute("""
                     UPDATE market_summary_24h
@@ -601,11 +606,14 @@ def run_pipeline(
     init_db(db_path)
 
     # 1. Unduh Benchmark Bitcoin terlebih dahulu
-    btc_bench = fetch_btc_benchmark(intervals=["4h", "1h", "15m"], db_path=db_path)
+    btc_intervals = list(dict.fromkeys([interval, "4h", "1h", "15m"]))
+    btc_bench = fetch_btc_benchmark(intervals=btc_intervals, db_path=db_path)
     btc_price = btc_bench.get("btc_price", 0.0)
-    btc_4h = btc_bench.get("btc_return_4h", 0.0)
-    btc_1h = btc_bench.get("btc_return_1h", 0.0)
-    print(f"[✓] Benchmark BTC: ${btc_price:,.2f} | 4H Return: {btc_4h:+.2f}% | 1H Return: {btc_1h:+.2f}%")
+    btc_4h = btc_bench.get("btc_return_4h")
+    btc_1h = btc_bench.get("btc_return_1h")
+    ret_4h = f"{btc_4h:+.2f}%" if btc_4h is not None else "N/A"
+    ret_1h = f"{btc_1h:+.2f}%" if btc_1h is not None else "N/A"
+    print(f"[✓] Benchmark BTC: ${btc_price:,.2f} | 4H Return: {ret_4h} | 1H Return: {ret_1h}")
 
     print(f"[*] [Tahap 1] Mengunduh ringkasan pasar 24 jam dari Binance...")
     df_top = fetch_24h_summary(top_n=top_n, db_path=db_path)
@@ -634,7 +642,7 @@ def run_pipeline(
         update_whale_flow_from_klines(interval=interval, db_path=db_path)
     
     # Baca kembali ringkasan yang telah terupdate
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         df_updated = pd.read_sql("SELECT * FROM market_summary_24h ORDER BY quote_volume DESC", conn)
 
     return df_updated
@@ -646,4 +654,3 @@ if __name__ == "__main__":
     df = run_pipeline(interval="2h", top_n=50, limit=100)
     print("\nContoh 5 Koin Teratas Berdasarkan Turnover & Whale Flow:")
     print(df[["symbol", "last_price", "price_change_pct", "quote_volume", "taker_buy_ratio"]].head(5))
-

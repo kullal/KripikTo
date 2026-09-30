@@ -530,7 +530,11 @@ def print_final_executive_report(final_picks: List[Dict[str, Any]]) -> None:
         fr_str = f"{r.get('funding_rate', 0.0):+.3f}%"
         setup_str = r.get("setup_type", "NO_SETUP")
         stat_str = r.get("entry_status", "WAIT")
-        if stat_str == "READY":
+        if stat_str == "TRIGGERED":
+            stat_str = "🎯 TRIG"
+        elif stat_str == "FAILED":
+            stat_str = "❌ FAIL"
+        elif stat_str == "READY":
             stat_str = "🚀 RDY"
         elif stat_str == "EXTENDED":
             stat_str = "⚠️ EXT"

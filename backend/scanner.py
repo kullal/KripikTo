@@ -19,6 +19,7 @@ import sys
 import json
 import sqlite3
 import datetime
+from contextlib import closing
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 import pandas as pd
@@ -60,6 +61,10 @@ try:
         evaluate_15m_trigger,
         DEFAULT_WEIGHTS
     )
+    from backend.data_integrity import (
+        aligned_relative_strength, validate_closed_candles, validate_market_summary,
+        utc_now_ms, STRUCTURE_MIN_CANDLES, MOMENTUM_MIN_CANDLES, TRIGGER_MIN_CANDLES,
+    )
 except ImportError:
     from data_pipeline import (
         is_stablecoin_or_excluded, NON_CRYPTO_PAIRS, STABLECOIN_PAIRS,
@@ -73,12 +78,16 @@ except ImportError:
         evaluate_15m_trigger,
         DEFAULT_WEIGHTS
     )
+    from data_integrity import (
+        aligned_relative_strength, validate_closed_candles, validate_market_summary,
+        utc_now_ms, STRUCTURE_MIN_CANDLES, MOMENTUM_MIN_CANDLES, TRIGGER_MIN_CANDLES,
+    )
 
 
 
 def init_scanner_db(db_path: str = DB_PATH) -> None:
     """Inisialisasi tabel hasil pemindaian dan pelacakan hasil (Outcome Tracker) di SQLite."""
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         cursor = conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS scan_results (
@@ -179,7 +188,12 @@ def init_scanner_db(db_path: str = DB_PATH) -> None:
             ("vol_ratio_1h", "REAL"),
             ("delta_oi_1h", "REAL"),
             ("delta_oi_4h", "REAL"),
-            ("delta_funding_1h", "REAL")
+            ("delta_funding_1h", "REAL"),
+            ("rs_structure", "REAL"), ("coin_return_structure", "REAL"),
+            ("btc_return_structure", "REAL"), ("rs_structure_status", "TEXT"),
+            ("rs_1h_status", "TEXT"), ("data_quality_status", "TEXT"),
+            ("data_quality_notes", "TEXT"), ("candle_open_time", "INTEGER"),
+            ("candle_close_time_ms", "INTEGER")
         ]
         for col, ctype in new_cols:
             if col not in cols:
@@ -200,7 +214,11 @@ def init_scanner_db(db_path: str = DB_PATH) -> None:
             ("momentum_score", "INTEGER"), ("flow_score", "INTEGER"),
             ("derivative_score", "INTEGER"),
             ("delta_oi_1h", "REAL"), ("delta_oi_4h", "REAL"),
-            ("delta_funding_1h", "REAL")
+            ("delta_funding_1h", "REAL"),
+            ("rs_structure", "REAL"), ("data_quality_status", "TEXT"),
+            ("data_quality_notes", "TEXT"), ("rs_structure_status", "TEXT"),
+            ("rs_1h_status", "TEXT"), ("candle_open_time", "INTEGER"),
+            ("candle_close_time_ms", "INTEGER")
         ]:
             if col not in so_cols:
                 try:
@@ -208,6 +226,7 @@ def init_scanner_db(db_path: str = DB_PATH) -> None:
                 except Exception:
                     pass
         conn.commit()
+        cursor.close()
 
 
 
@@ -222,13 +241,40 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return atr.fillna(df["close"] * 0.035)
 
 
+def _save_quality_report(report: Dict[str, Any]) -> None:
+    path = Path(SCAN_JSON_PATH).with_name("data_quality_latest.json")
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2, ensure_ascii=False, allow_nan=False)
+
+
+def _report_quality_check(report: Dict[str, Any], label: str, clean: pd.DataFrame, issues: Dict[str, list]) -> None:
+    report["checks"][label] = {
+        "accepted_symbols": int(clean["symbol"].nunique()) if not clean.empty else 0,
+        "rejected": issues,
+    }
+    if issues:
+        print(f"[!] Data Integrity [{label}]: {len(issues)} simbol tidak lolos.")
+        for symbol, reasons in list(issues.items())[:10]:
+            print(f"    {symbol}: {', '.join(reasons)}")
+        if len(issues) > 10:
+            print("    Rincian lengkap tersimpan di data_quality_latest.json.")
+
+
+def _empty_scan(report: Dict[str, Any]) -> pd.DataFrame:
+    _save_quality_report(report)
+    with open(SCAN_JSON_PATH, "w", encoding="utf-8") as handle:
+        json.dump([], handle)
+    return pd.DataFrame()
+
+
 def run_scanner(
     interval: str = "4h",
     min_score: int = 40,
     top_n: int = 20,
     fgi: Optional[Dict[str, Any]] = None,
     trigger_15m: bool = True,
-    db_path: str = DB_PATH
+    db_path: str = DB_PATH,
+    now_ms: Optional[int] = None,
 ) -> pd.DataFrame:
     """
     Menjalankan pemindaian kuantitatif & whale flow pada seluruh koin di database,
@@ -246,17 +292,25 @@ def run_scanner(
     # Ambil data derivatif (Funding Rate & Open Interest Binance Futures)
     deriv_map = fetch_derivatives_summary(db_path)
     active_spot = get_active_spot_symbols()
+    validation_time = utc_now_ms() if now_ms is None else now_ms
+    quality_report = {
+        "checked_at": datetime.datetime.fromtimestamp(validation_time / 1000, datetime.timezone.utc).isoformat(),
+        "structure_interval": interval, "checks": {}, "benchmark": {},
+    }
 
     # Ambil benchmark pasar Bitcoin (BTCUSDT) untuk Relative Strength (RS)
-    btc_bench = get_btc_benchmark(db_path)
-    btc_ret_4h = float(btc_bench.get("btc_return_4h", 0.0))
-    btc_ret_1h = float(btc_bench.get("btc_return_1h", 0.0))
-    btc_series_4h = get_btc_benchmark_time_series(interval="4h", db_path=db_path)
-    btc_series_1h = get_btc_benchmark_time_series(interval="1h", db_path=db_path)
+    btc_structure_issues, btc_1h_issues = {}, {}
+    btc_series_structure = get_btc_benchmark_time_series(
+        interval=interval, db_path=db_path, now_ms=validation_time, quality_issues=btc_structure_issues,
+    )
+    btc_series_1h = get_btc_benchmark_time_series(
+        interval="1h", db_path=db_path, now_ms=validation_time, quality_issues=btc_1h_issues,
+    )
+    quality_report["benchmark"] = {interval: btc_structure_issues, "1h": btc_1h_issues}
 
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         df_klines = pd.read_sql(
-            "SELECT * FROM klines_history WHERE interval = ? AND (is_closed = 1 OR is_closed IS NULL) ORDER BY symbol, open_time ASC",
+            "SELECT * FROM klines_history WHERE interval = ? AND is_closed = 1 ORDER BY symbol, open_time ASC",
             conn,
             params=(interval,)
         )
@@ -264,31 +318,32 @@ def run_scanner(
         
         # Ambil data lilin 1H dari database untuk kalkulasi Momentum Kinetik 1H & RS 1H
         df_1h = pd.read_sql(
-            "SELECT symbol, open_time, open, high, low, close, volume FROM klines_history WHERE interval = '1h' AND (is_closed = 1 OR is_closed IS NULL) ORDER BY symbol, open_time ASC",
+            "SELECT * FROM klines_history WHERE interval = '1h' AND is_closed = 1 ORDER BY symbol, open_time ASC",
             conn
         )
 
+    df_klines, structure_issues = validate_closed_candles(
+        df_klines, interval, STRUCTURE_MIN_CANDLES, now_ms=validation_time,
+    )
+    df_1h, momentum_issues = validate_closed_candles(
+        df_1h, "1h", MOMENTUM_MIN_CANDLES, now_ms=validation_time,
+    )
+    df_summary, summary_issues = validate_market_summary(df_summary, now_ms=validation_time)
+    _report_quality_check(quality_report, f"structure_{interval}", df_klines, structure_issues)
+    _report_quality_check(quality_report, "momentum_1h", df_1h, momentum_issues)
+    _report_quality_check(quality_report, "market_summary", df_summary, summary_issues)
     if df_klines.empty or df_summary.empty:
         print(f"[!] Data klines interval [{interval}] atau market_summary_24h kosong.")
         print("[*] Jalankan data_pipeline terlebih dahulu.")
-        return pd.DataFrame()
+        return _empty_scan(quality_report)
 
     # Ekstraksi fitur momentum kinetik 1H (KripikTo v2)
-    feat_1h_map = extract_1h_momentum_features(df_1h, btc_ret_1h=btc_ret_1h) if not df_1h.empty else {}
-
-    # Hitung return 1H per simbol sebagai cadangan
-    ret_1h_map = {}
-    if not df_1h.empty:
-        last_two_1h = df_1h.groupby("symbol").tail(2)
-        for s, grp in last_two_1h.groupby("symbol"):
-            if len(grp) >= 2:
-                c_now = float(grp.iloc[-1]["close"])
-                c_prev = float(grp.iloc[-2]["close"])
-                if c_prev > 0:
-                    ret_1h_map[s] = round(((c_now - c_prev) / c_prev) * 100.0, 2)
+    feat_1h_map = extract_1h_momentum_features(df_1h, btc_returns=btc_series_1h) if not df_1h.empty else {}
 
     # 1. Hitung Indikator Teknikal Bergulir per Simbol (Vectorized Groupby pada CLOSED candles)
     df_klines["prev_close"] = df_klines.groupby("symbol")["close"].shift(1)
+    df_klines["prev_open_time"] = df_klines.groupby("symbol")["open_time"].shift(1)
+    df_klines["prev_close_time"] = df_klines.groupby("symbol")["close_time"].shift(1)
     df_klines["ret_candle"] = ((df_klines["close"] - df_klines["prev_close"]) / df_klines["prev_close"].replace(0, np.nan)) * 100.0
     df_klines["ma20"] = df_klines.groupby("symbol")["close"].transform(lambda x: x.rolling(20, min_periods=5).mean())
     df_klines["ma50"] = df_klines.groupby("symbol")["close"].transform(lambda x: x.rolling(50, min_periods=10).mean())
@@ -299,16 +354,16 @@ def run_scanner(
     df_klines["atr14"] = calculate_atr(df_klines, period=14)
 
     # Ambil baris candlestick tertutup terbaru (Latest Closed Candle) untuk tiap koin
-    latest_tech = df_klines.groupby("symbol").last().reset_index()
+    latest_tech = df_klines.groupby("symbol", sort=False).tail(1).reset_index(drop=True)
 
     # Gabungkan dengan data ringkasan pasar 24h & Whale Ratio 24h (Pisahkan volume lilin vs volume 24 jam)
     merged = pd.merge(latest_tech, df_summary, on="symbol", how="inner", suffixes=("_candle", "_24h"))
 
     if merged.empty:
         print("[!] Tidak ada data yang cocok antara klines dan market summary.")
-        return pd.DataFrame()
+        return _empty_scan(quality_report)
 
-    now_utc_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    now_utc_str = datetime.datetime.fromtimestamp(validation_time / 1000, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     results = []
 
     for _, row in merged.iterrows():
@@ -343,7 +398,9 @@ def run_scanner(
         quote_vol_24h = float(row["quote_volume_24h"])
         taker_ratio = float(row["taker_buy_ratio"])
         quote_vol_m = quote_vol_24h / 1_000_000.0
-        candle_close_time = str(row.get("datetime_utc", ""))
+        candle_close_time = datetime.datetime.fromtimestamp(
+            float(row["close_time"]) / 1000, datetime.timezone.utc,
+        ).strftime("%Y-%m-%d %H:%M:%S")
 
         # Data derivatif & time-series deltas (Fase 4)
         deriv = deriv_map.get(sym, {})
@@ -354,11 +411,13 @@ def run_scanner(
         delta_oi_4h = float(deltas.get("delta_oi_4h", 0.0))
         delta_funding_1h = float(deltas.get("delta_funding_1h", 0.0))
 
-        # Relative Strength 4H vs BTC dengan verifikasi keselarasan timestamp (Fase 2)
-        coin_open_time = int(row.get("open_time", 0))
-        coin_ret_4h = round(float(row["ret_candle"]), 2) if pd.notnull(row.get("ret_candle")) else 0.0
-        btc_matched_ret_4h = btc_series_4h.get(coin_open_time, btc_ret_4h)
-        rs_4h = round(coin_ret_4h - btc_matched_ret_4h, 2)
+        # Match the actual structure interval and both candles of the return.
+        coin_return_structure = float(row["ret_candle"])
+        matched_rs, btc_matched_structure, structure_rs_status = aligned_relative_strength(
+            row, btc_series_structure, coin_return_structure,
+        )
+        # NaN contributes no positive/negative RS points; output uses explicit null.
+        rs_4h = matched_rs if matched_rs is not None else np.nan
 
         # Fitur kinetik 1H dari feature_engine
         feat_1h = feat_1h_map.get(sym, {
@@ -368,7 +427,9 @@ def run_scanner(
             "atr_1h": float(row["atr14"]) if pd.notnull(row.get("atr14")) else (close * 0.035),
             "atr_expansion_ratio": 1.0,
             "vol_ratio_1h": 1.0,
-            "rs_1h": 0.0,
+            "rs_1h": None,
+            "rs_1h_status": "MOMENTUM_DATA_UNAVAILABLE",
+            "btc_return_1h": None,
             "open_time_1h": 0
         })
         roc_1h = float(feat_1h.get("roc_1h", 0.0))
@@ -376,12 +437,18 @@ def run_scanner(
         atr_exp = float(feat_1h.get("atr_expansion_ratio", 1.0))
         vol_r_1h = float(feat_1h.get("vol_ratio_1h", 1.0))
         atr_1h = float(feat_1h.get("atr_1h") or row["atr14"] or (close * 0.035))
-        coin_ret_1h = roc_1h if roc_1h != 0.0 else ret_1h_map.get(sym, 0.0)
-
-        # RS 1H terverifikasi timestamp
-        open_time_1h = int(feat_1h.get("open_time_1h", 0))
-        btc_matched_ret_1h = btc_series_1h.get(open_time_1h, btc_ret_1h)
-        rs_1h = round(coin_ret_1h - btc_matched_ret_1h, 2)
+        coin_ret_1h = roc_1h if sym in feat_1h_map else None
+        rs_1h = feat_1h["rs_1h"] if feat_1h["rs_1h"] is not None else np.nan
+        quality_notes = []
+        if sym not in feat_1h_map:
+            quality_notes.extend("1h:" + reason for reason in momentum_issues.get(sym, ["MISSING_CANDLES"]))
+        if structure_rs_status != "ALIGNED":
+            quality_notes.append(f"{interval}:{structure_rs_status}")
+        if feat_1h["rs_1h_status"] != "ALIGNED":
+            quality_notes.append("1h:" + feat_1h["rs_1h_status"])
+        data_quality_status = "PARTIAL" if quality_notes else "OK"
+        if quality_notes:
+            signals.append("DATA_PARTIAL (" + "; ".join(quality_notes) + ")")
 
         # =========================================================================
         # 1. PERHITUNGAN SKOR V1 (LEGACY COMPOSITE - Disimpan untuk Validasi A/B)
@@ -470,12 +537,12 @@ def run_scanner(
 
         if rs_4h >= 3.0:
             structure_score += 5
-            signals.append(f"OUTPERFORM_BTC_4H (RS:{rs_4h:+.1f}%)")
+            signals.append(f"OUTPERFORM_BTC_{interval.upper()} (RS:{rs_4h:+.1f}%)")
         elif rs_4h >= 1.5:
             structure_score += 3
         elif rs_4h < -2.0:
             structure_score -= 5
-            signals.append(f"UNDERPERFORM_BTC_4H (RS:{rs_4h:+.1f}%)")
+            signals.append(f"UNDERPERFORM_BTC_{interval.upper()} (RS:{rs_4h:+.1f}%)")
 
         structure_score = max(0, min(DEFAULT_WEIGHTS["structure"], structure_score))
 
@@ -531,6 +598,8 @@ def run_scanner(
             signals.append("RSI_OVERSOLD_REBOUND")
 
         momentum_score = max(0, min(DEFAULT_WEIGHTS["momentum"], momentum_score))
+        if sym not in feat_1h_map:
+            momentum_score = 0
 
         # --- PILAR 3: WHALE FLOW (ALIRAN DANA PAUS - Maksimal 20 Poin) ---
         flow_score = 0
@@ -630,6 +699,9 @@ def run_scanner(
         for stg in status_tags:
             if stg not in signals:
                 signals.append(stg)
+        if data_quality_status != "OK" and entry_status not in ("EXTENDED", "FAILED"):
+            entry_status = "WAIT"
+            signals.append("ENTRY_BLOCKED_DATA_QUALITY")
 
         # =========================================================================
         # 4. TRADING PLAN & TARGET PROFIT / STOP LOSS DINAMIS (BERBASIS ATR 1H)
@@ -709,12 +781,21 @@ def run_scanner(
             "buy_high": buy_high,
             "entry_price": entry_price,
             "atr14": round(target_atr, dec),
-            "rs_4h": rs_4h,
-            "rs_1h": rs_1h,
-            "coin_return_4h": coin_ret_4h,
+            "rs_4h": matched_rs if interval == "4h" else None,
+            "rs_structure": matched_rs,
+            "rs_1h": feat_1h["rs_1h"],
+            "rs_structure_status": structure_rs_status,
+            "rs_1h_status": feat_1h["rs_1h_status"],
+            "data_quality_status": data_quality_status,
+            "data_quality_notes": "; ".join(quality_notes),
+            "candle_open_time": int(row["open_time"]),
+            "candle_close_time_ms": int(row["close_time"]),
+            "coin_return_structure": round(coin_return_structure, 2),
+            "btc_return_structure": btc_matched_structure,
+            "coin_return_4h": round(coin_return_structure, 2) if interval == "4h" else None,
             "coin_return_1h": coin_ret_1h,
-            "btc_return_4h": btc_ret_4h,
-            "btc_return_1h": btc_ret_1h,
+            "btc_return_4h": btc_matched_structure if interval == "4h" else None,
+            "btc_return_1h": feat_1h["btc_return_1h"],
             "stop_loss": sl_price,
             "stop_loss_pct": sl_pct,
             "tp1": tp1_price,
@@ -726,7 +807,7 @@ def run_scanner(
 
     if not results:
         print("[!] Tidak ada koin yang memenuhi kriteria minimum score.")
-        return pd.DataFrame()
+        return _empty_scan(quality_report)
 
     df_results = pd.DataFrame(results)
     # Urutkan berdasarkan Skor v2 tertinggi, lalu Whale Ratio tertinggi
@@ -746,6 +827,7 @@ def run_scanner(
     if trigger_15m and not df_top_picks.empty:
         candidate_syms = df_top_picks[
             (df_top_picks["v2_score"] >= min_score) &
+            (df_top_picks["data_quality_status"] == "OK") &
             (df_top_picks["setup_type"].isin([
                 "MOMENTUM_RUNNER", "MOMENTUM_FORMING",
                 "STRUCTURE_BULLISH", "ACCUMULATION_COIL"
@@ -756,31 +838,46 @@ def run_scanner(
             print(f"[*] [Fase 5] Mengunduh & memvalidasi pemicu taktis 15M untuk {len(candidate_syms)} koin kandidat...")
             try:
                 fetch_15m_trigger_batch(symbols=candidate_syms, limit=60, db_path=db_path)
-                with sqlite3.connect(db_path) as conn:
+                with closing(sqlite3.connect(db_path)) as conn:
                     placeholders = ",".join(["?"] * len(candidate_syms))
                     df_15m = pd.read_sql(
                         f"""
-                        SELECT symbol, open_time, open, high, low, close, volume
+                        SELECT *
                         FROM klines_history
-                        WHERE interval = '15m' AND symbol IN ({placeholders}) AND (is_closed = 1 OR is_closed IS NULL)
+                        WHERE interval = '15m' AND symbol IN ({placeholders}) AND is_closed = 1
                         ORDER BY symbol, open_time ASC
                         """,
                         conn,
                         params=candidate_syms
                     )
 
+                trigger_time = utc_now_ms() if now_ms is None else now_ms
+                df_15m, trigger_issues = validate_closed_candles(
+                    df_15m, "15m", TRIGGER_MIN_CANDLES, now_ms=trigger_time,
+                )
+                for missing_symbol in set(candidate_syms) - set(df_15m["symbol"]):
+                    trigger_issues.setdefault(missing_symbol, ["MISSING_CANDLES"])
+                _report_quality_check(quality_report, "trigger_15m", df_15m, trigger_issues)
                 trigger_15m_map = evaluate_15m_trigger(df_15m)
 
                 for idx, r in df_top_picks.iterrows():
                     sym = r["symbol"]
                     t_info = trigger_15m_map.get(sym)
+                    if sym in trigger_issues:
+                        reason = "15m:" + ",".join(trigger_issues[sym])
+                        df_top_picks.at[idx, "data_quality_status"] = "PARTIAL"
+                        df_top_picks.at[idx, "data_quality_notes"] = reason
+                        df_top_picks.at[idx, "signals"] = r["signals"] + ", TRIGGER_UNAVAILABLE (" + reason + ")"
+                        if r["entry_status"] not in ("EXTENDED", "FAILED"):
+                            df_top_picks.at[idx, "entry_status"] = "WAIT"
+                        continue
                     if t_info:
                         t_status = t_info["trigger_status"]
                         t_reason = t_info["trigger_reason"]
                         t_tags = t_info.get("tags", [])
 
                         # Jika setup mendapatkan konfirmasi 15M (Breakout vol spike atau retest bounce)
-                        if t_status == "TRIGGERED":
+                        if t_status == "TRIGGERED" and r["entry_status"] not in ("EXTENDED", "FAILED"):
                             df_top_picks.at[idx, "entry_status"] = "TRIGGERED"
                             # Perketat Buy Area dengan mikro-support 15M
                             ref_low = t_info["refined_buy_low"]
@@ -807,12 +904,13 @@ def run_scanner(
                             df_top_picks.at[idx, "tp2_pct"] = new_targets["tp2_pct"]
                             df_top_picks.at[idx, "risk_reward"] = new_targets["risk_reward"]
 
+                        elif t_status == "TRIGGERED":
+                            t_reason = f"⚠️ 15M_TRIGGER_BLOCKED (Status struktur: {r['entry_status']})"
+                            t_tags = t_tags + ["HIGHER_TIMEFRAME_ENTRY_BLOCKED"]
                         elif t_status == "EXTENDED":
-                            if r["entry_status"] != "WAIT":
-                                df_top_picks.at[idx, "entry_status"] = "EXTENDED"
+                            df_top_picks.at[idx, "entry_status"] = "EXTENDED"
                         elif t_status == "FAILED":
-                            if r["setup_type"] != "ACCUMULATION_COIL":
-                                df_top_picks.at[idx, "entry_status"] = "FAILED"
+                            df_top_picks.at[idx, "entry_status"] = "FAILED"
 
                         # Tambahkan sinyal & alasan 15M
                         cur_signals = r["signals"]
@@ -825,6 +923,18 @@ def run_scanner(
                         df_top_picks.at[idx, "signals"] = ", ".join(all_sigs)
             except Exception as e:
                 print(f"[!] Evaluasi trigger 15M dilewati karena kendala: {e}")
+                quality_report["checks"]["trigger_15m"] = {
+                    "accepted_symbols": 0,
+                    "rejected": {symbol: ["TRIGGER_EVALUATION_ERROR"] for symbol in candidate_syms},
+                }
+                for idx, row in df_top_picks.iterrows():
+                    if row["symbol"] not in candidate_syms:
+                        continue
+                    df_top_picks.at[idx, "data_quality_status"] = "PARTIAL"
+                    df_top_picks.at[idx, "data_quality_notes"] = "15m:TRIGGER_EVALUATION_ERROR"
+                    df_top_picks.at[idx, "signals"] = row["signals"] + ", TRIGGER_UNAVAILABLE (15m:TRIGGER_EVALUATION_ERROR)"
+                    if row["entry_status"] not in ("EXTENDED", "FAILED"):
+                        df_top_picks.at[idx, "entry_status"] = "WAIT"
 
     # Final ranking after 15M information is available.
     status_rank = {"TRIGGERED": 4, "READY": 3, "WAIT": 2, "EXTENDED": 1, "FAILED": 0}
@@ -834,9 +944,17 @@ def run_scanner(
         ascending=[False, False, False, False]
     ).head(top_n).copy()
     df_top_picks.drop(columns=["_entry_rank"], inplace=True, errors="ignore")
+    signal_time = utc_now_ms() if now_ms is None else now_ms
+    df_top_picks["scan_time"] = datetime.datetime.fromtimestamp(
+        signal_time / 1000, datetime.timezone.utc,
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    quality_report["signals"] = df_top_picks[[
+        "symbol", "data_quality_status", "data_quality_notes", "rs_structure_status", "rs_1h_status",
+    ]].to_dict(orient="records")
+    _save_quality_report(quality_report)
 
     # Simpan hasil scan ke SQLite
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         cursor = conn.cursor()
         insert_query = """
             INSERT OR REPLACE INTO scan_results (
@@ -847,8 +965,10 @@ def run_scanner(
                 rs_4h, rs_1h, coin_return_4h, coin_return_1h, btc_return_4h, btc_return_1h,
                 setup_type, entry_status, structure_score, momentum_score, flow_score,
                 derivative_score, macro_score, v2_score, roc_1h, acceleration_1h,
-                atr_expansion, vol_ratio_1h
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                atr_expansion, vol_ratio_1h, rs_structure, coin_return_structure,
+                btc_return_structure, rs_structure_status, rs_1h_status,
+                data_quality_status, data_quality_notes, candle_open_time, candle_close_time_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         records = [
             (
@@ -861,7 +981,9 @@ def run_scanner(
                 r["rs_4h"], r["rs_1h"], r["coin_return_4h"], r["coin_return_1h"], r["btc_return_4h"], r["btc_return_1h"],
                 r["setup_type"], r["entry_status"], r["structure_score"], r["momentum_score"], r["flow_score"],
                 r["derivative_score"], r["macro_score"], r["v2_score"], r["roc_1h"], r["acceleration_1h"],
-                r["atr_expansion"], r["vol_ratio_1h"]
+                r["atr_expansion"], r["vol_ratio_1h"], r["rs_structure"], r["coin_return_structure"],
+                r["btc_return_structure"], r["rs_structure_status"], r["rs_1h_status"],
+                r["data_quality_status"], r["data_quality_notes"], r["candle_open_time"], r["candle_close_time_ms"]
             )
             for _, r in df_top_picks.iterrows()
         ]
@@ -873,8 +995,10 @@ def run_scanner(
                 scan_time, symbol, interval, buy_low, buy_high, entry_price,
                 stop_loss, tp1, tp2, atr14, v1_score, v2_score, setup_type, entry_status,
                 structure_score, momentum_score, flow_score, derivative_score,
-                rs_4h, rs_1h, btc_return_4h, btc_return_1h, result
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+                rs_4h, rs_1h, btc_return_4h, btc_return_1h, rs_structure,
+                data_quality_status, data_quality_notes, rs_structure_status, rs_1h_status,
+                candle_open_time, candle_close_time_ms, result
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
         """
         outcomes_records = [
             (
@@ -882,16 +1006,20 @@ def run_scanner(
                 r["stop_loss"], r["tp1"], r["tp2"], r["atr14"], r["v1_score"], r["v2_score"],
                 r["setup_type"], r["entry_status"],
                 r["structure_score"], r["momentum_score"], r["flow_score"], r["derivative_score"],
-                r["rs_4h"], r["rs_1h"], r["btc_return_4h"], r["btc_return_1h"]
+                r["rs_4h"], r["rs_1h"], r["btc_return_4h"], r["btc_return_1h"], r["rs_structure"],
+                r["data_quality_status"], r["data_quality_notes"], r["rs_structure_status"], r["rs_1h_status"],
+                r["candle_open_time"], r["candle_close_time_ms"]
             )
             for _, r in df_top_picks.iterrows()
         ]
         cursor.executemany(outcomes_query, outcomes_records)
         conn.commit()
+        cursor.close()
 
     # Simpan juga ke file JSON ringkasan
     with open(SCAN_JSON_PATH, "w", encoding="utf-8") as f:
-        json.dump(df_top_picks.to_dict(orient="records"), f, indent=2, ensure_ascii=False)
+        records = df_top_picks.astype(object).where(pd.notna(df_top_picks), None).to_dict(orient="records")
+        json.dump(records, f, indent=2, ensure_ascii=False, allow_nan=False)
 
     return df_top_picks
 
@@ -904,7 +1032,7 @@ def print_scan_report(df_picks: pd.DataFrame) -> None:
     print("\n" + "=" * 145)
     print("🔥 HASIL PEMINDAIAN SPOT SCALPING KRIPTO (KRIPIKTO v2: MTF + TAKSONOMI + DYNAMIC ATR)")
     print("=" * 145)
-    print(f"{'NO':<3} {'SIMBOL':<10} {'HARGA ($)':<10} {'24H %':<8} {'SETUP TYPE':<18} {'STATUS':<9} {'SKOR':<5} {'STR':<4} {'MOM':<4} {'FLW':<4} {'RS 4H':<7} {'RS 1H':<7} {'TP1 %':<7} {'SL %':<7} {'SINYAL'}")
+    print(f"{'NO':<3} {'SIMBOL':<10} {'HARGA ($)':<10} {'24H %':<8} {'SETUP TYPE':<18} {'STATUS':<9} {'SKOR':<5} {'STR':<4} {'MOM':<4} {'FLW':<4} {'RS TF':<7} {'RS 1H':<7} {'TP1 %':<7} {'SL %':<7} {'SINYAL'}")
     print("-" * 145)
 
     for i, row in df_picks.iterrows():
@@ -927,10 +1055,10 @@ def print_scan_report(df_picks: pd.DataFrame) -> None:
         mom_s = row.get("momentum_score", 0)
         flw_s = row.get("flow_score", 0)
 
-        rs4_val = row.get('rs_4h', 0.0)
-        rs4_str = f"{rs4_val:+.1f}%" if pd.notnull(rs4_val) else "0.0%"
-        rs1_val = row.get('rs_1h', 0.0)
-        rs1_str = f"{rs1_val:+.1f}%" if pd.notnull(rs1_val) else "0.0%"
+        rs4_val = row.get('rs_structure', row.get('rs_4h'))
+        rs4_str = f"{rs4_val:+.1f}%" if pd.notnull(rs4_val) else "N/A"
+        rs1_val = row.get('rs_1h')
+        rs1_str = f"{rs1_val:+.1f}%" if pd.notnull(rs1_val) else "N/A"
 
         tp1_p = f"+{row['tp1_pct']:.1f}%" if pd.notnull(row.get('tp1_pct')) else "+4.5%"
         sl_p = f"{row['stop_loss_pct']:.1f}%" if pd.notnull(row.get('stop_loss_pct')) else "-4.0%"
