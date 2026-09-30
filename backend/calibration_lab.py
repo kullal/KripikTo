@@ -82,10 +82,13 @@ def split_train_test(df: pd.DataFrame, train_ratio: float = 0.70) -> Tuple[pd.Da
     - 70% awal: In-Sample Training (pencarian parameter & kalibrasi bobot)
     - 30% akhir: Out-of-Sample Test (pengujian performa murni)
     """
-    if len(df) < 10:
-        return df, df
+    # OOS validation is not meaningful on a tiny dataset.
+    if len(df) < 30:
+        return pd.DataFrame(), pd.DataFrame()
 
     split_idx = int(len(df) * train_ratio)
+    if split_idx < 20 or (len(df) - split_idx) < 10:
+        return pd.DataFrame(), pd.DataFrame()
     df_train = df.iloc[:split_idx].copy().reset_index(drop=True)
     df_test = df.iloc[split_idx:].copy().reset_index(drop=True)
     return df_train, df_test
@@ -296,53 +299,78 @@ def analyze_feature_correlations(df: pd.DataFrame) -> pd.DataFrame:
     return df_corr
 
 
-def optimize_pillar_weights(df_train: pd.DataFrame, df_corr: pd.DataFrame) -> Dict[str, int]:
-    """
-    Kalibrasi Bobot 5 Pilar Kuantitatif Matematis Berbasis Data Training (Spesifikasi Fase 6.6):
-    Baseline: Structure: 25, Momentum: 30, Flow: 20, Derivatives: 15, News: 10 = Total 100.
-    Menggunakan Edge Spread empiris untuk menyetel distribusi bobot tanpa asumsi dogmatis.
-    """
-    # Bobot lantai minimum agar tidak ada pilar yang mati total
-    base_floor = {
-        "structure": 15,
-        "momentum": 20,
-        "flow": 15,
-        "derivatives": 10,
-        "news": 10
+def _evaluate_weight_set(df: pd.DataFrame, weights: Dict[str, int]) -> Dict[str, float]:
+    """Evaluate candidate pillar weights against training outcomes."""
+    cols = {
+        "structure": ("structure_score", 25),
+        "momentum": ("momentum_score", 30),
+        "flow": ("flow_score", 20),
+        "derivatives": ("derivative_score", 15),
     }
-    # Sisa 30 poin didistribusikan secara proporsional sesuai daya dorong profit (Edge Spread)
-    if df_corr.empty:
-        return {"structure": 25, "momentum": 30, "flow": 20, "derivatives": 15, "news": 10}
+    if df.empty or any(col not in df.columns for col, _ in cols.values()):
+        return {}
 
-    corr_dict = dict(zip(df_corr["kode"], df_corr["edge_spread"]))
-    
-    # Daya dorong relatif tiap pilar
-    mom_edge = max(0.1, corr_dict.get("scan_rsi14", 1.5) + corr_dict.get("momentum_score", 1.0))
-    str_edge = max(0.1, corr_dict.get("scan_score", 1.2) + corr_dict.get("structure_score", 0.8))
-    flw_edge = max(0.1, corr_dict.get("scan_vol_ratio", 0.6) + max(0.0, corr_dict.get("scan_taker_ratio", 0.0)))
-    der_edge = max(0.1, corr_dict.get("scan_funding_rate", 1.2) + corr_dict.get("derivative_score", 0.8))
+    x = df.copy()
+    score = 0.0
+    for name, (col, baseline_max) in cols.items():
+        vals = pd.to_numeric(x[col], errors="coerce").fillna(0.0)
+        score += (vals / float(baseline_max)) * float(weights[name])
+    x["_calibrated_score"] = score
 
-    total_edge = mom_edge + str_edge + flw_edge + der_edge
-    rem_pts = 30 # Poin yang diperebutkan secara dinamis
+    cutoff = x["_calibrated_score"].quantile(0.70)
+    selected = x[x["_calibrated_score"] >= cutoff].copy()
+    if selected.empty:
+        return {}
 
-    w_mom = base_floor["momentum"] + int(round((mom_edge / total_edge) * rem_pts))
-    w_str = base_floor["structure"] + int(round((str_edge / total_edge) * rem_pts))
-    w_der = base_floor["derivatives"] + int(round((der_edge / total_edge) * rem_pts))
-    w_flw = base_floor["flow"] + int(round((flw_edge / total_edge) * rem_pts))
-    w_news = 10
-
-    # Normalisasi agar total persis 100
-    sum_w = w_mom + w_str + w_der + w_flw + w_news
-    diff = 100 - sum_w
-    w_mom += diff
+    results = selected["result"].astype(str)
+    success_rate = results.isin(["TP1_HIT", "TP2_HIT"]).mean() * 100.0
+    timeout_rate = (results == "TIMEOUT").mean() * 100.0
+    avg_mfe = pd.to_numeric(selected["mfe_pct"], errors="coerce").mean()
+    avg_mae = pd.to_numeric(selected["mae_pct"], errors="coerce").mean()
+    objective = success_rate - 0.35 * timeout_rate + 0.10 * float(avg_mfe or 0.0) + 0.05 * float(avg_mae or 0.0)
 
     return {
-        "structure": int(w_str),
-        "momentum": int(w_mom),
-        "flow": int(w_flw),
-        "derivatives": int(w_der),
-        "news": int(w_news)
+        "objective": float(objective),
+        "success_rate": float(success_rate),
+        "timeout_rate": float(timeout_rate),
+        "avg_mfe": float(avg_mfe or 0.0),
+        "avg_mae": float(avg_mae or 0.0),
+        "selected_count": int(len(selected))
     }
+
+
+def optimize_pillar_weights(df_train: pd.DataFrame, df_corr: pd.DataFrame) -> Dict[str, int]:
+    """
+    Empirically test candidate weights on training outcomes.
+    News stays at 10 until historical news scores are available in snapshots.
+    """
+    if len(df_train) < 20:
+        return {"structure": 25, "momentum": 30, "flow": 20, "derivatives": 15, "news": 10}
+
+    best = None
+    for structure in range(15, 36, 5):
+        for momentum in range(20, 41, 5):
+            for flow in range(10, 26, 5):
+                derivatives = 90 - structure - momentum - flow
+                if not 10 <= derivatives <= 25:
+                    continue
+                weights = {
+                    "structure": structure,
+                    "momentum": momentum,
+                    "flow": flow,
+                    "derivatives": derivatives,
+                    "news": 10
+                }
+                metrics = _evaluate_weight_set(df_train, weights)
+                if not metrics:
+                    continue
+                key = (metrics["objective"], metrics["success_rate"], -metrics["timeout_rate"])
+                if best is None or key > best[0]:
+                    best = (key, weights)
+
+    if best is None:
+        return {"structure": 25, "momentum": 30, "flow": 20, "derivatives": 15, "news": 10}
+    return {k: int(v) for k, v in best[1].items()}
 
 
 def save_calibrated_config(
@@ -358,6 +386,7 @@ def save_calibrated_config(
         "validation_method": "Time-Series Train/Test Split (70% In-Sample / 30% Out-of-Sample)",
         "train_sample_trades": train_metrics.get("total_trades", 0),
         "test_sample_trades": test_metrics.get("total_trades", 0),
+        "minimum_oos_sample_required": 10,
         "tp_atr_multiplier": best_params.get("tp_mult", 1.8),
         "sl_atr_multiplier": best_params.get("sl_mult", 1.4),
         "target_profit_1_pct": round(best_params.get("tp_mult", 1.8) * 3.0, 1),
@@ -466,6 +495,9 @@ def run_calibration_lab(
 
     # 1. Time-series Train/Test Split
     df_train, df_test = split_train_test(df_dataset, train_ratio=0.70)
+    if df_train.empty or df_test.empty:
+        print(f"[!] Dataset belum cukup untuk OOS validation. Minimal 30 filled signals; saat ini {len(df_dataset)}.")
+        return
 
     # 2. Grid Search Dynamic ATR pada data Train
     df_grid_train = run_dynamic_atr_grid_search(df_train)
