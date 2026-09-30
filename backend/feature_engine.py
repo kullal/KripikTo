@@ -50,14 +50,16 @@ DEFAULT_WEIGHTS = _CALIBRATED_CFG.get("weights", {
 
 
 def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """Menghitung Relative Strength Index (RSI 14)."""
+    """RSI dengan rata-rata rolling; warm-up dan harga datar bernilai netral 50."""
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
     avg_gain = gain.rolling(window=period, min_periods=period).mean()
     avg_loss = loss.rolling(window=period, min_periods=period).mean()
-    rs = avg_gain / avg_loss.replace(0, 1e-9)
+    rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100.0 - (100.0 / (1.0 + rs))
+    rsi = rsi.mask((avg_loss == 0) & (avg_gain > 0), 100.0)
+    rsi = rsi.mask((avg_loss == 0) & (avg_gain == 0), 50.0)
     return rsi.fillna(50.0)
 
 

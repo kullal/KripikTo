@@ -1,5 +1,12 @@
 # KripikTo: Sistem Pemindai Kripto Kuantitatif & Analisis Sentimen AI
 
+RSI scanner dan trigger 15M menggunakan satu implementasi di `backend/feature_engine.py`.
+Perhitungan mempertahankan rata-rata rolling gain/loss: warm-up dan harga datar bernilai 50,
+kenaikan tanpa penurunan bernilai 100, dan penurunan tanpa kenaikan bernilai 0.
+Jalankan tes regresi indikator lokal dengan `python -m unittest discover -s tests -v`.
+Hasil scan historis tetap menyimpan nilai indikator saat scan tersebut dibuat; perbaikan
+berlaku pada scan berikutnya.
+
 Sistem pemindai pasar aset kripto otomatis berbasis kombinasi data **Kuantitatif (Candlestick Klines + Whale Flow / Bandarmologi Paus)** dan **Kualitatif (Analisis Sentimen Berita Global dengan Google Gemini Flash LLM + Crypto Risk Guard)**.
 
 ---

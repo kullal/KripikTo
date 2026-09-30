@@ -53,6 +53,7 @@ try:
         get_active_spot_symbols, get_btc_benchmark, get_btc_benchmark_time_series, fetch_15m_trigger_batch
     )
     from backend.feature_engine import (
+        calculate_rsi,
         extract_1h_momentum_features,
         classify_setup_and_status,
         calculate_dynamic_tp_sl,
@@ -65,6 +66,7 @@ except ImportError:
         get_active_spot_symbols, get_btc_benchmark, get_btc_benchmark_time_series, fetch_15m_trigger_batch
     )
     from feature_engine import (
+        calculate_rsi,
         extract_1h_momentum_features,
         classify_setup_and_status,
         calculate_dynamic_tp_sl,
@@ -209,15 +211,6 @@ def init_scanner_db(db_path: str = DB_PATH) -> None:
 
 
 
-def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """Menghitung Relative Strength Index (RSI 14)."""
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(window=period, min_periods=period).mean()
-    avg_loss = loss.rolling(window=period, min_periods=period).mean()
-    rs = avg_gain / avg_loss.replace(0, 1e-9)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
 def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     """Menghitung Average True Range (ATR 14) untuk mengukur volatilitas nyata koin."""
     prev_close = df.groupby("symbol")["close"].shift(1)
