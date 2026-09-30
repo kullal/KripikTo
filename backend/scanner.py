@@ -52,10 +52,22 @@ try:
         is_stablecoin_or_excluded, NON_CRYPTO_PAIRS, STABLECOIN_PAIRS,
         get_active_spot_symbols, get_btc_benchmark
     )
+    from backend.feature_engine import (
+        extract_1h_momentum_features,
+        classify_setup_and_status,
+        calculate_dynamic_tp_sl,
+        DEFAULT_WEIGHTS
+    )
 except ImportError:
     from data_pipeline import (
         is_stablecoin_or_excluded, NON_CRYPTO_PAIRS, STABLECOIN_PAIRS,
         get_active_spot_symbols, get_btc_benchmark
+    )
+    from feature_engine import (
+        extract_1h_momentum_features,
+        classify_setup_and_status,
+        calculate_dynamic_tp_sl,
+        DEFAULT_WEIGHTS
     )
 
 
@@ -148,7 +160,19 @@ def init_scanner_db(db_path: str = DB_PATH) -> None:
             ("coin_return_4h", "REAL"),
             ("coin_return_1h", "REAL"),
             ("btc_return_4h", "REAL"),
-            ("btc_return_1h", "REAL")
+            ("btc_return_1h", "REAL"),
+            ("setup_type", "TEXT"),
+            ("entry_status", "TEXT"),
+            ("structure_score", "INTEGER"),
+            ("momentum_score", "INTEGER"),
+            ("flow_score", "INTEGER"),
+            ("derivative_score", "INTEGER"),
+            ("macro_score", "INTEGER"),
+            ("v2_score", "INTEGER"),
+            ("roc_1h", "REAL"),
+            ("acceleration_1h", "REAL"),
+            ("atr_expansion", "REAL"),
+            ("vol_ratio_1h", "REAL")
         ]
         for col, ctype in new_cols:
             if col not in cols:
@@ -161,8 +185,13 @@ def init_scanner_db(db_path: str = DB_PATH) -> None:
         cursor.execute("PRAGMA table_info(signal_outcomes)")
         so_cols = {c[1] for c in cursor.fetchall()}
         for col, ctype in [
+            ("buy_low", "REAL"), ("buy_high", "REAL"),
             ("rs_4h", "REAL"), ("rs_1h", "REAL"),
-            ("btc_return_4h", "REAL"), ("btc_return_1h", "REAL")
+            ("btc_return_4h", "REAL"), ("btc_return_1h", "REAL"),
+            ("v2_score", "INTEGER"), ("setup_type", "TEXT"),
+            ("entry_status", "TEXT"), ("structure_score", "INTEGER"),
+            ("momentum_score", "INTEGER"), ("flow_score", "INTEGER"),
+            ("derivative_score", "INTEGER")
         ]:
             if col not in so_cols:
                 try:
@@ -230,9 +259,9 @@ def run_scanner(
         )
         df_summary = pd.read_sql("SELECT * FROM market_summary_24h", conn)
         
-        # Ambil return 1H dari database untuk kalkulasi Relative Strength 1H
+        # Ambil data lilin 1H dari database untuk kalkulasi Momentum Kinetik 1H & RS 1H
         df_1h = pd.read_sql(
-            "SELECT symbol, close, open_time FROM klines_history WHERE interval = '1h' AND (is_closed = 1 OR is_closed IS NULL) ORDER BY symbol, open_time ASC",
+            "SELECT symbol, open_time, open, high, low, close, volume FROM klines_history WHERE interval = '1h' AND (is_closed = 1 OR is_closed IS NULL) ORDER BY symbol, open_time ASC",
             conn
         )
 
@@ -241,7 +270,10 @@ def run_scanner(
         print("[*] Jalankan data_pipeline terlebih dahulu.")
         return pd.DataFrame()
 
-    # Hitung return 1H per simbol
+    # Ekstraksi fitur momentum kinetik 1H (KripikTo v2)
+    feat_1h_map = extract_1h_momentum_features(df_1h, btc_ret_1h=btc_ret_1h) if not df_1h.empty else {}
+
+    # Hitung return 1H per simbol sebagai cadangan
     ret_1h_map = {}
     if not df_1h.empty:
         last_two_1h = df_1h.groupby("symbol").tail(2)
@@ -291,7 +323,7 @@ def run_scanner(
             continue
 
         signals = []
-        score = 0
+        v1_score = 0
 
         # PERBAIKAN BUG VOLUME: Bandingkan volume lilin tertutup tunggal dengan MA20 lilin tertutup
         vol_candle = float(row["volume_candle"])
@@ -310,137 +342,277 @@ def run_scanner(
         quote_vol_m = quote_vol_24h / 1_000_000.0
         candle_close_time = str(row.get("datetime_utc", ""))
 
-        # --- A. DETEKSI WHALE FLOW (ALIRAN DANA PAUS) ---
-        if taker_ratio >= 55.0:
-            score += 25
-            signals.append("PAUS_AKUMULASI_KUAT")
-        elif taker_ratio >= 52.0:
-            score += 15
-            signals.append("PAUS_INFLOW")
-        elif taker_ratio < 45.0:
-            score -= 15
-            signals.append("TEKANAN_JUAL_BESAR")
-
-        # Divergensi Paus: Harga flat/koreksi tipis tapi Paus borong agresif
-        if -4.0 <= change_24h <= 2.0 and taker_ratio >= 53.0:
-            score += 20
-            signals.append("WHALE_DIVERGENCE (Nyicil Diam-diam)")
-
-        # Ambil data derivatif koin jika ada di Binance Futures
+        # Data derivatif
         deriv = deriv_map.get(sym, {})
         funding_rate = float(deriv.get("funding_rate", 0.0))
         oi_m = float(deriv.get("open_interest_m", 0.0))
 
-        # --- A2. DETEKSI ANOMALI DERIVATIF (POTENSI SHORT SQUEEZE SPOT SCALPING) ---
+        # Relative Strength 4H & 1H vs BTC
+        coin_ret_4h = round(float(row["ret_candle"]), 2) if pd.notnull(row.get("ret_candle")) else 0.0
+        rs_4h = round(coin_ret_4h - btc_ret_4h, 2)
+
+        # Fitur kinetik 1H dari feature_engine
+        feat_1h = feat_1h_map.get(sym, {
+            "close_1h": close,
+            "roc_1h": 0.0,
+            "acceleration_1h": 0.0,
+            "atr_1h": float(row["atr14"]) if pd.notnull(row.get("atr14")) else (close * 0.035),
+            "atr_expansion_ratio": 1.0,
+            "vol_ratio_1h": 1.0,
+            "rs_1h": 0.0
+        })
+        roc_1h = float(feat_1h.get("roc_1h", 0.0))
+        accel_1h = float(feat_1h.get("acceleration_1h", 0.0))
+        atr_exp = float(feat_1h.get("atr_expansion_ratio", 1.0))
+        vol_r_1h = float(feat_1h.get("vol_ratio_1h", 1.0))
+        atr_1h = float(feat_1h.get("atr_1h") or row["atr14"] or (close * 0.035))
+        coin_ret_1h = roc_1h if roc_1h != 0.0 else ret_1h_map.get(sym, 0.0)
+        rs_1h = float(feat_1h.get("rs_1h", round(coin_ret_1h - btc_ret_1h, 2)))
+
+        # =========================================================================
+        # 1. PERHITUNGAN SKOR V1 (LEGACY COMPOSITE - Disimpan untuk Validasi A/B)
+        # =========================================================================
+        if taker_ratio >= 55.0:
+            v1_score += 25
+        elif taker_ratio >= 52.0:
+            v1_score += 15
+        elif taker_ratio < 45.0:
+            v1_score -= 15
+
+        if -4.0 <= change_24h <= 2.0 and taker_ratio >= 53.0:
+            v1_score += 20
+
         if funding_rate <= -0.10:
-            score += 25
+            v1_score += 25
+        elif funding_rate <= -0.02:
+            v1_score += 15
+        elif funding_rate >= +0.05:
+            v1_score -= 15
+
+        if oi_m >= 10.0 and funding_rate < -0.01:
+            v1_score += 10
+
+        if close > prev_high20 and prev_high20 > 0:
+            v1_score += 25
+        elif close >= (prev_high20 * 0.985):
+            v1_score += 12
+
+        if vol_ratio >= 2.0:
+            v1_score += 20
+        elif vol_ratio >= 1.4:
+            v1_score += 10
+
+        if close > ma20 and close > ma50:
+            v1_score += 15 if ma20 > ma50 else 10
+        elif close > ma20:
+            v1_score += 5
+        elif close < ma20 and close < ma50:
+            v1_score -= 10
+
+        if 52.0 <= rsi <= 68.0:
+            v1_score += 12
+        elif rsi < 35.0:
+            v1_score += 12
+        elif rsi >= 80.0:
+            v1_score -= 15
+
+        if change_24h > 35.0:
+            v1_score -= 20
+
+        if rs_4h >= 3.0 and rs_1h >= 1.0:
+            v1_score += 15
+        elif rs_4h >= 1.5:
+            v1_score += 8
+        elif rs_4h < -2.0 and rs_1h < -1.0:
+            v1_score -= 10
+
+        v1_score = max(0, min(100, v1_score))
+
+        # =========================================================================
+        # 2. SISTEM SKORING 5 PILAR MODULAR KRIPIKTO V2 (Max 100 Poin)
+        # =========================================================================
+
+        # --- PILAR 1: STRUKTUR TREN 4H (Maksimal 25 Poin) ---
+        structure_score = 0
+        if close > ma20 and close > ma50:
+            if ma20 > ma50:
+                structure_score += 10
+                signals.append("SUPER_BULLISH_TREND")
+            else:
+                structure_score += 7
+                signals.append("BULLISH_CROSS_UP")
+        elif close > ma20:
+            structure_score += 4
+            signals.append("ABOVE_MA20")
+        elif close < ma20 and close < ma50:
+            structure_score -= 5
+
+        if close > prev_high20 and prev_high20 > 0:
+            structure_score += 10
+            signals.append("BREAKOUT_20_BAR_HIGH")
+        elif close >= (prev_high20 * 0.985):
+            structure_score += 5
+            signals.append("MENDEKATI_BREAKOUT")
+
+        if rs_4h >= 3.0:
+            structure_score += 5
+            signals.append(f"OUTPERFORM_BTC_4H (RS:{rs_4h:+.1f}%)")
+        elif rs_4h >= 1.5:
+            structure_score += 3
+        elif rs_4h < -2.0:
+            structure_score -= 5
+            signals.append(f"UNDERPERFORM_BTC_4H (RS:{rs_4h:+.1f}%)")
+
+        structure_score = max(0, min(DEFAULT_WEIGHTS["structure"], structure_score))
+
+        # --- PILAR 2: KINETIK MOMENTUM 1H (Maksimal 30 Poin) ---
+        momentum_score = 0
+        # Kecepatan ROC 1H
+        if roc_1h >= 2.5:
+            momentum_score += 8
+            signals.append(f"ROC_1H_STRONG ({roc_1h:+.1f}%)")
+        elif roc_1h >= 1.0:
+            momentum_score += 5
+            signals.append(f"ROC_1H_POSITIVE ({roc_1h:+.1f}%)")
+        elif roc_1h < -1.5:
+            momentum_score -= 5
+
+        # Akselerasi Harga 1H (Delta ROC / Turunan Kecepatan)
+        if accel_1h >= 1.5:
+            momentum_score += 7
+            signals.append(f"ACCEL_1H_HIGH ({accel_1h:+.1f}%)")
+        elif accel_1h >= 0.5:
+            momentum_score += 4
+        elif accel_1h < -1.5:
+            momentum_score -= 4
+
+        # Volatility Expansion Ratio (ATR 1H vs SMA20 ATR 1H)
+        if atr_exp >= 1.25:
+            momentum_score += 5
+            signals.append(f"VOLATILITY_EXPANSION ({atr_exp:.1f}x)")
+        elif 0.85 <= atr_exp < 1.25:
+            momentum_score += 2
+
+        # Lonjakan Volume 1H
+        if vol_r_1h >= 2.0:
+            momentum_score += 5
+            signals.append(f"VOL_SURGE_1H ({vol_r_1h:.1f}x)")
+        elif vol_r_1h >= 1.4:
+            momentum_score += 3
+
+        # Relative Strength 1H vs BTC
+        if rs_1h >= 1.5:
+            momentum_score += 5
+            signals.append(f"RS_1H_BEATING_BTC ({rs_1h:+.1f}%)")
+        elif rs_1h >= 0.5:
+            momentum_score += 3
+        elif rs_1h < -1.0:
+            momentum_score -= 4
+
+        # RSI filter sehat
+        if 52.0 <= rsi <= 68.0:
+            momentum_score += 3
+        elif rsi < 35.0:
+            momentum_score += 3
+            signals.append("RSI_OVERSOLD_REBOUND")
+
+        momentum_score = max(0, min(DEFAULT_WEIGHTS["momentum"], momentum_score))
+
+        # --- PILAR 3: WHALE FLOW (ALIRAN DANA PAUS - Maksimal 20 Poin) ---
+        flow_score = 0
+        if taker_ratio >= 55.0:
+            flow_score += 15
+            signals.append("PAUS_AKUMULASI_KUAT")
+        elif taker_ratio >= 52.0:
+            flow_score += 10
+            signals.append("PAUS_INFLOW")
+        elif taker_ratio < 45.0:
+            flow_score -= 10
+            signals.append("TEKANAN_JUAL_BESAR")
+
+        if -4.0 <= change_24h <= 2.0 and taker_ratio >= 53.0:
+            flow_score += 5
+            signals.append("WHALE_DIVERGENCE (Nyicil Diam-diam)")
+
+        flow_score = max(0, min(DEFAULT_WEIGHTS["flow"], flow_score))
+
+        # --- PILAR 4: DERIVATIF & SHORT SQUEEZE (Maksimal 15 Poin) ---
+        derivative_score = 0
+        if funding_rate <= -0.10:
+            derivative_score += 12
             signals.append(f"EXTREME_SHORT_SQUEEZE (FR: {funding_rate:+.3f}%)")
         elif funding_rate <= -0.02:
-            score += 15
+            derivative_score += 8
             signals.append(f"POTENSI_SHORT_SQUEEZE (FR: {funding_rate:+.3f}%)")
         elif funding_rate >= +0.05:
-            score -= 15
+            derivative_score -= 8
             signals.append("RISIKO_LONG_DUMP (Hindari Beli Pucuk)")
 
         if oi_m >= 10.0 and funding_rate < -0.01:
-            score += 10
+            derivative_score += 3
             signals.append(f"BIG_OI_SHORT_POOL (${oi_m}M)")
 
-        # --- B. DETEKSI AKSI HARGA & BREAKOUT ---
+        derivative_score = max(0, min(DEFAULT_WEIGHTS["derivatives"], derivative_score))
 
-        if close > prev_high20 and prev_high20 > 0:
-            score += 25
-            signals.append("BREAKOUT_20_BAR_HIGH")
-        elif close >= (prev_high20 * 0.985):
-            score += 12
-            signals.append("MENDEKATI_BREAKOUT")
-
-        # --- C. DETEKSI LONJAKAN VOLUME (VOLUME SURGE) ---
-        if vol_ratio >= 2.0:
-            score += 20
-            signals.append("VOLUME_MELEDAK (>2x)")
-        elif vol_ratio >= 1.4:
-            score += 10
-            signals.append("VOLUME_SURGE (>1.4x)")
-
-        # --- D. DETEKSI STRUKTUR TREN (MA20 & MA50) ---
-        if close > ma20 and close > ma50:
-            if ma20 > ma50:
-                score += 15
-                signals.append("SUPER_BULLISH_TREND")
-            else:
-                score += 10
-                signals.append("BULLISH_CROSS_UP")
-        elif close > ma20:
-            score += 5
-            signals.append("ABOVE_MA20")
-        elif close < ma20 and close < ma50:
-            score -= 10
-
-        # --- E. DETEKSI MOMENTUM RSI 14 ---
-        if 52.0 <= rsi <= 68.0:
-            score += 12
-            signals.append("RSI_HEALTHY_MOMENTUM")
-        elif rsi < 35.0:
-            # Rebound oversold
-            score += 12
-            signals.append("RSI_OVERSOLD_REBOUND")
-        elif rsi >= 80.0:
-            # Bahaya pucuk / overbought ekstrem
-            score -= 15
-            signals.append("RSI_OVERBOUGHT_EXTREME")
-
-        # --- F. FILTER PENALTI POMPAAN EKSTREM ---
-        if change_24h > 35.0:
-            score -= 20
-            signals.append("RISIKO_PUCUK (Naik >35%)")
-
-        # --- F2. RELATIVE STRENGTH (RS) VS BITCOIN BENCHMARK (RS_4H & RS_1H) ---
-        coin_ret_4h = round(float(row["ret_candle"]), 2) if pd.notnull(row.get("ret_candle")) else 0.0
-        coin_ret_1h = ret_1h_map.get(sym, 0.0)
-        rs_4h = round(coin_ret_4h - btc_ret_4h, 2)
-        rs_1h = round(coin_ret_1h - btc_ret_1h, 2)
-
-        if rs_4h >= 3.0 and rs_1h >= 1.0:
-            score += 15
-            signals.append(f"OUTPERFORM_BTC_STRONG (RS4h:{rs_4h:+.1f}%, RS1h:{rs_1h:+.1f}%)")
-        elif rs_4h >= 1.5:
-            score += 8
-            signals.append(f"OUTPERFORM_BTC_4H (RS:{rs_4h:+.1f}%)")
-        elif rs_4h < -2.0 and rs_1h < -1.0:
-            score -= 10
-            signals.append(f"UNDERPERFORM_BTC (RS4h:{rs_4h:+.1f}%)")
-
-        # --- G. PENYESUAIAN REZIM MAKRO AKADEMIK (FEAR & GREED INDEX) ---
-        if fgi_regime == "EXTREME_FEAR":
-            # Riset: Penipisan likuiditas -> False breakout tinggi
-            if "BREAKOUT_20_BAR_HIGH" in signals:
-                score -= 8
-                signals.append("PENALTI_LIQUIDITY_DEPLETION")
-            # Riset: Smart money accumulation di harga diskon
-            if "WHALE_DIVERGENCE (Nyicil Diam-diam)" in signals:
-                score += 10
-                signals.append("SMART_MONEY_BOTTOM_BOOSTER")
-        elif fgi_regime == "GREED":
-            # Riset: Order-flow pressure searah -> Breakout win rate tinggi
+        # --- PILAR 5: MAKRO BAROMETER (Maksimal 10 Poin) ---
+        macro_score = 5 # Baseline
+        if fgi_regime == "GREED":
             if "BREAKOUT_20_BAR_HIGH" in signals and vol_ratio >= 1.4:
-                score += 5
+                macro_score += 3
                 signals.append("ORDER_FLOW_PRESSURE_BOOST")
+            else:
+                macro_score += 2
+        elif fgi_regime == "EXTREME_FEAR":
+            if "WHALE_DIVERGENCE (Nyicil Diam-diam)" in signals:
+                macro_score += 4
+                signals.append("SMART_MONEY_BOTTOM_BOOSTER")
+            if "BREAKOUT_20_BAR_HIGH" in signals:
+                macro_score -= 3
+                signals.append("PENALTI_LIQUIDITY_DEPLETION")
         elif fgi_regime == "EXTREME_GREED":
-            # Riset JBEF: Asymmetric tail risk (risiko flash dump tiba-tiba)
+            macro_score -= 2
             signals.append("⚠️ WASPADA_TAIL_RISK")
 
-        score = max(0, min(100, score))
+        macro_score = max(0, min(DEFAULT_WEIGHTS["news"], macro_score))
 
-        if score < min_score:
+        # --- SKOR TOTAL V2 KOMPOSIT ---
+        v2_score = structure_score + momentum_score + flow_score + derivative_score + macro_score
+
+        # Penalti risiko pompaan ekstrem
+        if change_24h > 35.0:
+            v2_score -= 15
+            signals.append("RISIKO_PUCUK (Naik >35%)")
+        if rsi >= 80.0:
+            v2_score -= 10
+            signals.append("RSI_OVERBOUGHT_EXTREME")
+
+        v2_score = max(0, min(100, v2_score))
+
+        # Filter minimum score berdasarkan v2_score
+        if v2_score < min_score:
             continue
 
-        # --- H. TRADING PLAN CERDAS: STRATEGI RETEST & ANTI-BELI PUCUK ---
-        # 1. Deteksi Overextension (Jarak harga terhadap MA20 & RSI)
+        # =========================================================================
+        # 3. KLASIFIKASI TAKSONOMI PASAR & STATUS ENTRI (KRIPIKTO V2)
+        # =========================================================================
         is_overextended = (close > ma20 * 1.035) or (rsi >= 68.0) or (prev_high20 > 0 and close > prev_high20 * 1.025)
-        
-        # 2. Penentuan Support Kunci untuk Titik Beli (Pullback / Retest)
-        # Jika breakout terjadi, support utama adalah batas atas breakout sebelumnya (retest level) atau MA20
+
+        setup_type, entry_status, status_tags = classify_setup_and_status(
+            structure_score=structure_score,
+            momentum_score=momentum_score,
+            flow_score=flow_score,
+            atr_expansion=atr_exp,
+            roc_1h=roc_1h,
+            rs_1h=rs_1h,
+            is_overextended=is_overextended
+        )
+        for stg in status_tags:
+            if stg not in signals:
+                signals.append(stg)
+
+        # =========================================================================
+        # 4. TRADING PLAN & TARGET PROFIT / STOP LOSS DINAMIS (BERBASIS ATR 1H)
+        # =========================================================================
         if "BREAKOUT_20_BAR_HIGH" in signals or "MENDEKATI_BREAKOUT" in signals:
             support_level = max(ma20, prev_high20) if prev_high20 > 0 else ma20
         else:
@@ -448,45 +620,36 @@ def run_scanner(
 
         dec = 8 if close < 0.01 else (6 if close < 1.0 else 4)
 
-        # 3. Hitung Buy Area Diskon (Bukan Beli di Harga Running Close):
         if is_overextended:
             signals.append("⏳ TUNGGU_RETEST (Antre Diskon di Support)")
-            score = max(0, score - 8) # Kurangi skor FOMO beli di pucuk
-            # Buy area diarahkan ke area retest support, bukan di pucuk candle
             buy_low = round(max(support_level * 0.992, close * 0.93), dec)
             buy_high = round(min(support_level * 1.015, close * 0.978), dec)
             if buy_low >= buy_high:
                 buy_low = round(close * 0.95, dec)
                 buy_high = round(close * 0.975, dec)
         else:
-            # Jika harga masih dekat support / konsolidasi sehat:
             signals.append("🎯 AREA_BUY_SEHAT (Dekat Support)")
             buy_low = round(max(support_level * 0.995, close * 0.982), dec)
-            buy_high = round(close * 0.995, dec) # Antre limit sedikit di bawah running
+            buy_high = round(close * 0.995, dec)
             if buy_low >= buy_high:
                 buy_low = round(close * 0.98, dec)
                 buy_high = round(close * 0.995, dec)
 
-        # Titik acuan entri harga antrean (midpoint buy area)
         entry_price = (buy_low + buy_high) / 2.0
         if entry_price <= 0:
             entry_price = max(close, 1e-8)
 
-        # 4. Stop Loss Adaptif berbasis ATR & Support Struktural:
-        atr_val = float(row["atr14"]) if pd.notnull(row.get("atr14")) and row["atr14"] > 0 else (entry_price * 0.035)
-        structural_sl = min(support_level * 0.985, entry_price - (1.2 * atr_val))
+        # Target Profit & Stop Loss Dinamis via feature_engine (MFE +4.5% & MAE -2.93% compliant)
+        target_atr = atr_1h if atr_1h > 0 else (float(row["atr14"]) if pd.notnull(row.get("atr14")) and row["atr14"] > 0 else (entry_price * 0.035))
+        tp_sl = calculate_dynamic_tp_sl(entry_price=entry_price, support_level=support_level, atr_val=target_atr, dec=dec)
         
-        # Batasi SL antara -4.0% s.d -5.8% dari harga beli antrean (mencegah SL tersapu noise wajar kripto)
-        sl_price = round(min(entry_price * 0.96, max(entry_price * 0.942, structural_sl)), dec)
-        sl_pct = round(((sl_price - entry_price) / entry_price) * 100.0, 2) if entry_price > 0 else -4.5
-
-        # 5. Take Profit (Dihitung dari entry_price, bukan dari harga pucuk):
-        tp1_pct = 6.0
-        tp1_price = round(entry_price * 1.06, dec)
-        tp2_pct = 12.0
-        tp2_price = round(entry_price * 1.12, dec)
-
-        rr_ratio = f"1 : {round(abs(tp1_pct / sl_pct), 1)}" if abs(sl_pct) > 0 else "1 : 1.5"
+        sl_price = tp_sl["stop_loss"]
+        sl_pct = tp_sl["stop_loss_pct"]
+        tp1_price = tp_sl["tp1"]
+        tp1_pct = tp_sl["tp1_pct"]
+        tp2_price = tp_sl["tp2"]
+        tp2_pct = tp_sl["tp2_pct"]
+        rr_ratio = tp_sl["risk_reward"]
         buy_area = f"${buy_low} - ${buy_high}"
 
         results.append({
@@ -502,14 +665,26 @@ def run_scanner(
             "open_interest_m": oi_m,
             "rsi14": round(rsi, 1),
             "vol_ratio": round(vol_ratio, 2),
-            "score": int(score),
-            "v1_score": int(score),
+            "score": int(v2_score),
+            "v1_score": int(v1_score),
+            "v2_score": int(v2_score),
+            "setup_type": setup_type,
+            "entry_status": entry_status,
+            "structure_score": int(structure_score),
+            "momentum_score": int(momentum_score),
+            "flow_score": int(flow_score),
+            "derivative_score": int(derivative_score),
+            "macro_score": int(macro_score),
+            "roc_1h": round(roc_1h, 2),
+            "acceleration_1h": round(accel_1h, 2),
+            "atr_expansion": round(atr_exp, 2),
+            "vol_ratio_1h": round(vol_r_1h, 2),
             "signals": ", ".join(signals),
             "buy_area": buy_area,
             "buy_low": buy_low,
             "buy_high": buy_high,
             "entry_price": entry_price,
-            "atr14": round(atr_val, dec),
+            "atr14": round(target_atr, dec),
             "rs_4h": rs_4h,
             "rs_1h": rs_1h,
             "coin_return_4h": coin_ret_4h,
@@ -530,9 +705,9 @@ def run_scanner(
         return pd.DataFrame()
 
     df_results = pd.DataFrame(results)
-    # Urutkan berdasarkan Skor tertinggi, lalu Whale Ratio tertinggi
+    # Urutkan berdasarkan Skor v2 tertinggi, lalu Whale Ratio tertinggi
     df_results = df_results.sort_values(
-        by=["score", "taker_buy_ratio", "quote_vol_m"],
+        by=["v2_score", "taker_buy_ratio", "quote_vol_m"],
         ascending=[False, False, False]
     ).reset_index(drop=True)
 
@@ -547,8 +722,11 @@ def run_scanner(
                 taker_buy_ratio, funding_rate, open_interest_m, rsi14, vol_ratio, score, signals,
                 buy_area, stop_loss, stop_loss_pct, tp1, tp1_pct, tp2, tp2_pct, risk_reward,
                 interval, candle_close_time, buy_low, buy_high, entry_price, atr14, v1_score,
-                rs_4h, rs_1h, coin_return_4h, coin_return_1h, btc_return_4h, btc_return_1h
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                rs_4h, rs_1h, coin_return_4h, coin_return_1h, btc_return_4h, btc_return_1h,
+                setup_type, entry_status, structure_score, momentum_score, flow_score,
+                derivative_score, macro_score, v2_score, roc_1h, acceleration_1h,
+                atr_expansion, vol_ratio_1h
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         records = [
             (
@@ -558,7 +736,10 @@ def run_scanner(
                 r["tp1"], r["tp1_pct"], r["tp2"], r["tp2_pct"], r["risk_reward"],
                 r["interval"], r["candle_close_time"], r["buy_low"], r["buy_high"], r["entry_price"],
                 r["atr14"], r["v1_score"],
-                r["rs_4h"], r["rs_1h"], r["coin_return_4h"], r["coin_return_1h"], r["btc_return_4h"], r["btc_return_1h"]
+                r["rs_4h"], r["rs_1h"], r["coin_return_4h"], r["coin_return_1h"], r["btc_return_4h"], r["btc_return_1h"],
+                r["setup_type"], r["entry_status"], r["structure_score"], r["momentum_score"], r["flow_score"],
+                r["derivative_score"], r["macro_score"], r["v2_score"], r["roc_1h"], r["acceleration_1h"],
+                r["atr_expansion"], r["vol_ratio_1h"]
             )
             for _, r in df_top_picks.iterrows()
         ]
@@ -567,14 +748,18 @@ def run_scanner(
         # Masukkan juga draft ke signal_outcomes untuk Outcome Tracker
         outcomes_query = """
             INSERT OR IGNORE INTO signal_outcomes (
-                scan_time, symbol, interval, entry_price, stop_loss, tp1, tp2, atr14, v1_score,
+                scan_time, symbol, interval, buy_low, buy_high, entry_price,
+                stop_loss, tp1, tp2, atr14, v1_score, v2_score, setup_type, entry_status,
+                structure_score, momentum_score, flow_score, derivative_score,
                 rs_4h, rs_1h, btc_return_4h, btc_return_1h, result
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
         """
         outcomes_records = [
             (
-                r["scan_time"], r["symbol"], r["interval"], r["entry_price"],
-                r["stop_loss"], r["tp1"], r["tp2"], r["atr14"], r["v1_score"],
+                r["scan_time"], r["symbol"], r["interval"], r["buy_low"], r["buy_high"], r["entry_price"],
+                r["stop_loss"], r["tp1"], r["tp2"], r["atr14"], r["v1_score"], r["v2_score"],
+                r["setup_type"], r["entry_status"],
+                r["structure_score"], r["momentum_score"], r["flow_score"], r["derivative_score"],
                 r["rs_4h"], r["rs_1h"], r["btc_return_4h"], r["btc_return_1h"]
             )
             for _, r in df_top_picks.iterrows()
@@ -590,44 +775,57 @@ def run_scanner(
 
 
 def print_scan_report(df_picks: pd.DataFrame) -> None:
-    """Menampilkan laporan tabel pemindaian yang rapi di terminal dengan indikator Relative Strength vs BTC."""
+    """Menampilkan laporan tabel pemindaian KripikTo v2 di terminal dengan taksonomi sinyal & target dinamis."""
     if df_picks.empty:
         return
 
-    print("\n" + "=" * 135)
-    print("🔥 HASIL PEMINDAIAN SPOT SCALPING & POTENSI SHORT SQUEEZE (TOP PICKS KRIPTO)")
-    print("=" * 135)
-    print(f"{'NO':<3} {'SIMBOL':<11} {'HARGA ($)':<11} {'CHG 24H':<9} {'RS 4H':<8} {'RS 1H':<8} {'TURNOVER':<10} {'WHALE %':<8} {'FUNDING %':<11} {'RSI':<6} {'SKOR':<5} {'SINYAL UTAMA'}")
-    print("-" * 135)
+    print("\n" + "=" * 145)
+    print("🔥 HASIL PEMINDAIAN SPOT SCALPING KRIPTO (KRIPIKTO v2: MTF + TAKSONOMI + DYNAMIC ATR)")
+    print("=" * 145)
+    print(f"{'NO':<3} {'SIMBOL':<10} {'HARGA ($)':<10} {'24H %':<8} {'SETUP TYPE':<18} {'STATUS':<9} {'SKOR':<5} {'STR':<4} {'MOM':<4} {'FLW':<4} {'RS 4H':<7} {'RS 1H':<7} {'TP1 %':<7} {'SL %':<7} {'SINYAL'}")
+    print("-" * 145)
 
     for i, row in df_picks.iterrows():
-        chg_str = f"{row['price_change_pct']:+.2f}%"
+        chg_str = f"{row['price_change_pct']:+.1f}%"
+        setup_str = row.get("setup_type", "NO_SETUP")
+        status_str = row.get("entry_status", "WAIT")
+        if status_str == "READY":
+            status_str = "🚀 READY"
+        elif status_str == "EXTENDED":
+            status_str = "⚠️ EXT"
+        else:
+            status_str = "⏳ WAIT"
+
+        v2_s = row.get("v2_score", row.get("score", 0))
+        str_s = row.get("structure_score", 0)
+        mom_s = row.get("momentum_score", 0)
+        flw_s = row.get("flow_score", 0)
+
         rs4_val = row.get('rs_4h', 0.0)
         rs4_str = f"{rs4_val:+.1f}%" if pd.notnull(rs4_val) else "0.0%"
         rs1_val = row.get('rs_1h', 0.0)
         rs1_str = f"{rs1_val:+.1f}%" if pd.notnull(rs1_val) else "0.0%"
-        whale_str = f"{row['taker_buy_ratio']:.1f}%"
-        fr_val = row.get('funding_rate', 0.0)
-        fr_str = f"{fr_val:+.3f}%" if pd.notnull(fr_val) else "0.000%"
+
+        tp1_p = f"+{row['tp1_pct']:.1f}%" if pd.notnull(row.get('tp1_pct')) else "+4.5%"
+        sl_p = f"{row['stop_loss_pct']:.1f}%" if pd.notnull(row.get('stop_loss_pct')) else "-4.0%"
         price_str = f"{row['last_price']:.4f}" if row['last_price'] < 1 else f"{row['last_price']:.2f}"
-        turnover_str = f"${row['quote_vol_m']:.1f}M"
 
-        # Potong sinyal agar rapi di terminal
         sigs = row['signals']
-        if len(sigs) > 35:
-            sigs = sigs[:32] + "..."
+        if len(sigs) > 28:
+            sigs = sigs[:25] + "..."
 
-        print(f"{i+1:<3} {row['symbol']:<11} {price_str:<11} {chg_str:<9} {rs4_str:<8} {rs1_str:<8} {turnover_str:<10} {whale_str:<8} {fr_str:<11} {row['rsi14']:<6.1f} {row['score']:<5} {sigs}")
+        print(f"{i+1:<3} {row['symbol']:<10} {price_str:<10} {chg_str:<8} {setup_str:<18} {status_str:<9} {v2_s:<5} {str_s:<4} {mom_s:<4} {flw_s:<4} {rs4_str:<7} {rs1_str:<7} {tp1_p:<7} {sl_p:<7} {sigs}")
 
-    print("=" * 135)
-    print("🎯 Strategi Spot Scalping: Target Profit Utama +6.0% langsung kunci keuntungan | Stop Loss ketat ~3.8%")
+    print("=" * 145)
+    print("💡 Taksonomi: MOMENTUM_RUNNER = Siap eksekusi | ACCUMULATION_COIL = Paus akumulasi diam-diam (Watchlist) | VOLATILITY_SQUEEZE = Tunggu ekspansi")
+    print("🎯 Target Dinamis: TP1 & SL dikalkulasi adaptif via ATR 1H & Support struktural (Validasi Empiris Outcome Tracker)")
     print(f"📁 Rekap JSON tersimpan di: {SCAN_JSON_PATH}\n")
 
 
 
 if __name__ == "__main__":
-    print("=== TEST RUN SCANNER (TAHAP 2) ===")
-    picks = run_scanner(interval="2h", min_score=40, top_n=15)
+    print("=== TEST RUN SCANNER (KRIPIKTO v2) ===")
+    picks = run_scanner(interval="4h", min_score=40, top_n=15)
     print_scan_report(picks)
     if not picks.empty:
         print("Contoh Trading Plan Koin Teratas (#1):")

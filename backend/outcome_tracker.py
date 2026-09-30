@@ -94,6 +94,11 @@ def init_outcome_tracker_db(db_path: str = DB_PATH) -> None:
             ("buy_high", "REAL"),
             ("v2_score", "INTEGER"),
             ("setup_type", "TEXT"),
+            ("entry_status", "TEXT"),
+            ("structure_score", "INTEGER"),
+            ("momentum_score", "INTEGER"),
+            ("flow_score", "INTEGER"),
+            ("derivative_score", "INTEGER"),
             ("rs_4h", "REAL"),
             ("rs_1h", "REAL"),
             ("btc_return_4h", "REAL"),
@@ -145,26 +150,45 @@ def import_signals_from_history(db_path: str = DB_PATH) -> int:
         try:
             cursor.execute("""
                 SELECT scan_time, symbol, interval, buy_area, buy_low, buy_high, entry_price,
-                       stop_loss, tp1, tp2, atr14, v1_score, rs_4h, rs_1h, btc_return_4h, btc_return_1h
+                       stop_loss, tp1, tp2, atr14, v1_score, v2_score, setup_type, entry_status,
+                       structure_score, momentum_score, flow_score, derivative_score,
+                       rs_4h, rs_1h, btc_return_4h, btc_return_1h
                 FROM scan_results
             """)
             rows = cursor.fetchall()
             for r in rows:
-                scan_t, sym, iv, area, b_low, b_high, ep, sl, tp1, tp2, atr, v1_s, rs4, rs1, btc4, btc1 = r
+                (scan_t, sym, iv, area, b_low, b_high, ep, sl, tp1, tp2, atr,
+                 v1_s, v2_s, stype, estatus, str_s, mom_s, flw_s, der_s, rs4, rs1, btc4, btc1) = r
                 if not b_low or not b_high or b_low <= 0:
                     b_low, b_high = parse_buy_area_str(area or "")
                 if not ep or ep <= 0:
                     ep = (b_low + b_high) / 2.0 if (b_low and b_high) else 0.0
 
+                # Masukkan sinyal baru jika belum ada
                 cursor.execute("""
                     INSERT OR IGNORE INTO signal_outcomes (
                         scan_time, symbol, interval, buy_low, buy_high, entry_price,
-                        stop_loss, tp1, tp2, atr14, v1_score, rs_4h, rs_1h,
-                        btc_return_4h, btc_return_1h, result
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
-                """, (scan_t, sym, iv or "4h", b_low, b_high, ep, sl, tp1, tp2, atr, v1_s, rs4, rs1, btc4, btc1))
+                        stop_loss, tp1, tp2, atr14, v1_score, v2_score, setup_type, entry_status,
+                        structure_score, momentum_score, flow_score, derivative_score,
+                        rs_4h, rs_1h, btc_return_4h, btc_return_1h, result
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+                """, (scan_t, sym, iv or "4h", b_low, b_high, ep, sl, tp1, tp2, atr,
+                      v1_s, v2_s, stype, estatus, str_s, mom_s, flw_s, der_s, rs4, rs1, btc4, btc1))
                 if cursor.rowcount > 0:
                     imported_count += 1
+                else:
+                    # Perbarui metadata v2 tanpa menimpa hasil evaluasi empiris yang sudah ada
+                    cursor.execute("""
+                        UPDATE signal_outcomes
+                        SET v2_score = COALESCE(?, v2_score),
+                            setup_type = COALESCE(?, setup_type),
+                            entry_status = COALESCE(?, entry_status),
+                            structure_score = COALESCE(?, structure_score),
+                            momentum_score = COALESCE(?, momentum_score),
+                            flow_score = COALESCE(?, flow_score),
+                            derivative_score = COALESCE(?, derivative_score)
+                        WHERE scan_time = ? AND symbol = ?
+                    """, (v2_s, stype, estatus, str_s, mom_s, flw_s, der_s, scan_t, sym))
             conn.commit()
         except Exception:
             pass
@@ -518,6 +542,26 @@ def print_outcome_scoreboard(df: pd.DataFrame) -> None:
     print(f"Rata-rata MAE (Max Drawdown Alami)  : {avg_mae:+.2f}%  (Uji apakah SL terlalu ketat)")
     print(f"Rata-rata Durasi Trade Selesai     : {avg_dur:.1f} jam")
     print("=" * 115)
+
+    # Breakdown performa berdasarkan TAKSONOMI SETUP KripikTo v2
+    if "setup_type" in df.columns:
+        valid_setups = df[df["setup_type"].notnull() & (df["setup_type"] != "")]
+        if not valid_setups.empty:
+            print("\n🔍 EVALUASI EMPIRIS BERDASARKAN TAKSONOMI SETUP (v2):")
+            print(f"{'SETUP TYPE':<22} {'TOTAL':<7} {'FILLED':<8} {'WIN RATE':<10} {'AVG MFE':<10} {'AVG MAE':<10}")
+            print("-" * 75)
+            for stype, grp in valid_setups.groupby("setup_type"):
+                st_tot = len(grp)
+                st_filled = grp[grp["is_filled"] == 1]
+                st_fill_cnt = len(st_filled)
+                st_wins = len(st_filled[st_filled["result"].isin(["TP1_HIT", "TP2_HIT"])])
+                st_losses = len(st_filled[st_filled["result"] == "SL_HIT"])
+                st_finished = st_wins + st_losses + len(st_filled[st_filled["result"] == "TIMEOUT"])
+                st_wr = (st_wins / st_finished * 100.0) if st_finished > 0 else 0.0
+                st_mfe = st_filled["mfe_pct"].mean() if not st_filled.empty else 0.0
+                st_mae = st_filled["mae_pct"].mean() if not st_filled.empty else 0.0
+                print(f"{stype:<22} {st_tot:<7} {st_fill_cnt:<8} {st_wr:>5.1f}%     {st_mfe:>+5.2f}%     {st_mae:>+5.2f}%")
+            print("-" * 75)
 
     print("\n📋 RINCIAN TRACKING INDIVIDUAL (SAMPLE TOP SINYAL HISTORIS):")
     print(f"{'WAKTU SCAN':<19} {'SIMBOL':<10} {'FILL PRICE':<11} {'TP1':<10} {'SL':<10} {'STATUS':<10} {'MFE %':<8} {'MAE %':<8} {'DURASI':<8}")
