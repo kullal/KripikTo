@@ -742,15 +742,21 @@ def run_scanner(
         ascending=[False, False, False]
     ).reset_index(drop=True)
 
-    df_top_picks = df_results.head(top_n).copy()
+    # 15M is evaluated before final top_n ranking.
+    # Funnel: 4H Structure -> 1H Momentum -> 15M Trigger -> Final Ranking.
+    candidate_pool_n = min(len(df_results), max(top_n * 3, 50))
+    df_top_picks = df_results.head(candidate_pool_n).copy()
 
     # =========================================================================
     # 5. TAHAP 15M TACTICAL TRIGGER CONFIRMATION (KRIPIKTO v2 FASE 5)
     # =========================================================================
     if trigger_15m and not df_top_picks.empty:
         candidate_syms = df_top_picks[
-            (df_top_picks["v2_score"] >= 40) &
-            (df_top_picks["setup_type"].isin(["MOMENTUM_RUNNER", "STRUCTURE_BULLISH", "ACCUMULATION_COIL"]))
+            (df_top_picks["v2_score"] >= min_score) &
+            (df_top_picks["setup_type"].isin([
+                "MOMENTUM_RUNNER", "MOMENTUM_FORMING",
+                "STRUCTURE_BULLISH", "ACCUMULATION_COIL"
+            ]))
         ]["symbol"].tolist()
 
         if candidate_syms:
@@ -826,6 +832,15 @@ def run_scanner(
                         df_top_picks.at[idx, "signals"] = ", ".join(all_sigs)
             except Exception as e:
                 print(f"[!] Evaluasi trigger 15M dilewati karena kendala: {e}")
+
+    # Final ranking after 15M information is available.
+    status_rank = {"TRIGGERED": 4, "READY": 3, "WAIT": 2, "EXTENDED": 1, "FAILED": 0}
+    df_top_picks["_entry_rank"] = df_top_picks["entry_status"].map(status_rank).fillna(0)
+    df_top_picks = df_top_picks.sort_values(
+        by=["_entry_rank", "v2_score", "taker_buy_ratio", "quote_vol_m"],
+        ascending=[False, False, False, False]
+    ).head(top_n).copy()
+    df_top_picks.drop(columns=["_entry_rank"], inplace=True, errors="ignore")
 
     # Simpan hasil scan ke SQLite
     with sqlite3.connect(db_path) as conn:
