@@ -162,6 +162,10 @@ def classify_setup_and_status(
         # Momentum Runner: Struktur, aliran paus, dan kinetik momentum akselerasi sejalan
         setup_type = "MOMENTUM_RUNNER"
         tags.append("MOMENTUM_RUNNER (Akselerasi Kinetik Positif)")
+    elif structure_score >= 18 and flow_score >= 14 and 12 <= momentum_score < 22:
+        # Explicit transition state between accumulation and a full momentum runner.
+        setup_type = "MOMENTUM_FORMING"
+        tags.append("MOMENTUM_FORMING (Energi Mulai Terbentuk)")
     elif atr_expansion < 0.85 and vol_ratio_4h <= 0.80 and structure_score >= 14:
         # Volatility Squeeze Sejati: Pita volatilitas menyempit DAN volume perdagangan kering
         setup_type = "VOLATILITY_SQUEEZE"
@@ -182,6 +186,9 @@ def classify_setup_and_status(
     elif setup_type == "ACCUMULATION_COIL":
         entry_status = "WAIT"
         tags.append("⏳ WAIT (Masuk Watchlist, Jangan Beli Sekarang)")
+    elif setup_type == "MOMENTUM_FORMING":
+        entry_status = "READY"
+        tags.append("👀 READY (Momentum mulai terbentuk, tunggu 15M)")
     elif setup_type == "VOLATILITY_SQUEEZE":
         entry_status = "WAIT"
         tags.append("⏳ WAIT (Tunggu Breakout Volatilitas)")
