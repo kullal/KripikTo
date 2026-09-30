@@ -85,7 +85,13 @@ def init_news_db(db_path: str = DB_PATH) -> None:
         # Auto-migration jika kolom belum ada
         cursor.execute("PRAGMA table_info(kripto_sentiment_analysis)")
         cols = [c[1] for c in cursor.fetchall()]
-        for col, ctype in [("funding_rate", "REAL"), ("open_interest_m", "REAL")]:
+        for col, ctype in [
+            ("funding_rate", "REAL"),
+            ("open_interest_m", "REAL"),
+            ("v2_score", "INTEGER"),
+            ("setup_type", "TEXT"),
+            ("entry_status", "TEXT")
+        ]:
             if col not in cols:
                 try:
                     cursor.execute(f"ALTER TABLE kripto_sentiment_analysis ADD COLUMN {col} {ctype}")
@@ -271,15 +277,42 @@ Kembalikan jawaban HANYA berupa JSON valid dengan skema berikut:
     }
 
 
-def calculate_composite_score(tech_score: int, sentiment_score: float, crypto_risk: bool = False) -> int:
+def calculate_news_pillar_score(sentiment_score: float) -> int:
     """
-    Menghitung skor gabungan akhir:
-    - 70% Bobot Teknikal & Whale Flow (0 - 100)
-    - 30% Bobot Sentimen Berita AI (-1.0 s.d +1.0 dinormalisasi ke 0 - 100)
-    - Pinalti keras jika terdeteksi risiko keamanan/exploit/delisting (maksimal skor 35)
+    Menghitung Skor Pilar ke-5 (AI News Sentiment - Maksimal 10 Poin):
+    Sesuai arsitektur 5 pilar KripikTo v2:
+    Structure: 25 | Momentum: 30 | Flow: 20 | Derivatives: 15 | AI News: 10 = Total 100
+    - sentiment_score rentang -1.0 s.d +1.0:
+      * >= +0.6 (Strong Bullish) -> 10 poin
+      * +0.2 s.d +0.5 (Bullish)  -> 8 poin
+      * -0.1 s.d +0.1 (Neutral)  -> 5 poin
+      * -0.5 s.d -0.2 (Bearish)  -> 2 poin
+      * < -0.5 (Strong Bearish)  -> 0 poin
     """
-    normalized_news = (sentiment_score + 1.0) / 2.0 * 100  # -1.0 -> 0, 0.0 -> 50, +1.0 -> 100
-    final_score = int(round(tech_score * 0.70 + normalized_news * 0.30))
+    if sentiment_score >= 0.6:
+        return 10
+    elif sentiment_score >= 0.2:
+        return 8
+    elif sentiment_score >= -0.1:
+        return 5
+    elif sentiment_score >= -0.5:
+        return 2
+    else:
+        return 0
+
+
+def calculate_unified_v2_final_score(
+    v2_score: int,
+    sentiment_score: float,
+    crypto_risk: bool = False
+) -> int:
+    """
+    Menyatukan skor kuantitatif v2 (maksimal 90 dari Pilar 1-4 + Makro baseline)
+    dengan Pilar ke-5 AI News (0 - 10 poin) ke dalam basis 100 poin tunggal yang konsisten.
+    Crypto Risk Guard: Hard safety override membatasi maksimal 35 jika ada risiko fatal.
+    """
+    news_pts = calculate_news_pillar_score(sentiment_score)
+    final_score = min(100, v2_score + news_pts)
     if crypto_risk:
         final_score = min(final_score, 35)
     return max(0, min(100, final_score))
@@ -288,19 +321,53 @@ def calculate_composite_score(tech_score: int, sentiment_score: float, crypto_ri
 def get_recommendation_label(
     final_score: int,
     sentiment: str,
-    tech_score: int,
-    crypto_risk: bool = False
+    v2_score: int,
+    crypto_risk: bool = False,
+    entry_status: str = "WAIT",
+    setup_type: str = "NO_SETUP"
 ) -> str:
-    """Menentukan label rekomendasi berdasarkan skor gabungan dan pengaman risiko."""
+    """
+    Menentukan label rekomendasi berdasarkan gerbang taksonomi status entri (Fase 5):
+    PRINSIP UTAMA:
+    - WAIT != BUY
+    - READY != BUY
+    - EXTENDED != BUY
+    Hanya status 'TRIGGERED' yang boleh menghasilkan sinyal beli (BUY)!
+    Skor tinggi tanpa pemicu taktis 15M hanya masuk status READY/WATCHLIST.
+    """
+    # 1. Hard Safety Override (Crypto Risk Guard)
     if crypto_risk:
         return "⚠️ AVOID (Hack / Exploit / Delisting Risk)"
-    elif tech_score >= 75 and sentiment == "BEARISH":
+
+    # 2. Bad News Divergence
+    if v2_score >= 70 and sentiment == "BEARISH":
         return "⚠️ CAUTION (Bad News Divergence)"
-    elif final_score >= 80:
-        return "🚀 STRONG_BUY (Paus + Katalis Bullish)"
-    elif final_score >= 65:
-        return "✅ BUY_MOMENTUM (Akumulasi Sehat)"
-    elif final_score >= 50:
+
+    # 3. Gerbang Eksekusi 15M (Triggered)
+    if entry_status == "TRIGGERED":
+        if setup_type == "MOMENTUM_RUNNER":
+            return "🚀 STRONG_BUY (15M Breakout Triggered)"
+        else:
+            return "🎯 TRIGGERED_BUY (15M Trigger Valid)"
+
+    # 4. Peringatan Pucuk (Extended)
+    if entry_status == "EXTENDED":
+        return "⚠️ OVEREXTENDED (Tunggu Pullback / Jangan Beli Pucuk)"
+
+    # 5. Setup Batal (Failed)
+    if entry_status == "FAILED":
+        return "❌ SETUP_FAILED (Breakdown di Bawah Support)"
+
+    # 6. Momentum Runner Siap Pemicu (Ready)
+    if entry_status == "READY":
+        return "👀 READY_WATCHLIST (Menunggu 15M Trigger - Jangan Beli Dulu)"
+
+    # 7. Status Konsolidasi / Akumulasi (Wait)
+    if setup_type == "ACCUMULATION_COIL":
+        return "⏳ ACCUMULATION (Paus Diam - Masuk Watchlist)"
+    elif setup_type == "VOLATILITY_SQUEEZE":
+        return "⏳ SQUEEZE_WAIT (Tunggu Ekspansi Volatilitas)"
+    elif final_score >= 60:
         return "👀 WATCHLIST (Pantau Support)"
     else:
         return "⏳ NEUTRAL / WAIT"
@@ -373,13 +440,23 @@ def run_news_sentiment_pipeline(
         catalyst = sentiment_res["catalyst"]
         crypto_risk = sentiment_res["crypto_risk"]
 
-        final_score = calculate_composite_score(tech_score, sent_score, crypto_risk)
-        recom = get_recommendation_label(final_score, sentiment, tech_score, crypto_risk)
+        v2_score = int(item.get("v2_score", tech_score))
+        setup_type = str(item.get("setup_type", "NO_SETUP"))
+        entry_status = str(item.get("entry_status", "WAIT"))
+
+        final_score = calculate_unified_v2_final_score(v2_score, sent_score, crypto_risk)
+        recom = get_recommendation_label(
+            final_score, sentiment, v2_score, crypto_risk,
+            entry_status=entry_status, setup_type=setup_type
+        )
 
         record = {
             "scan_time": now_utc_str,
             "symbol": sym,
             "tech_score": tech_score,
+            "v2_score": v2_score,
+            "setup_type": setup_type,
+            "entry_status": entry_status,
             "funding_rate": fr,
             "open_interest_m": oi_m,
             "sentiment": sentiment,
@@ -413,15 +490,17 @@ def run_news_sentiment_pipeline(
                 scan_time, symbol, tech_score, funding_rate, open_interest_m,
                 sentiment, sentiment_score, impact_level, catalyst, news_count,
                 crypto_risk, final_score, recommendation, buy_area, stop_loss,
-                stop_loss_pct, tp1, tp1_pct, tp2, tp2_pct, risk_reward
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                stop_loss_pct, tp1, tp1_pct, tp2, tp2_pct, risk_reward,
+                v2_score, setup_type, entry_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         records = [
             (
                 r["scan_time"], r["symbol"], r["tech_score"], r["funding_rate"], r["open_interest_m"],
                 r["sentiment"], r["sentiment_score"], r["impact_level"], r["catalyst"], r["news_count"],
                 r["crypto_risk"], r["final_score"], r["recommendation"], r["buy_area"], r["stop_loss"],
-                r["stop_loss_pct"], r["tp1"], r["tp1_pct"], r["tp2"], r["tp2_pct"], r["risk_reward"]
+                r["stop_loss_pct"], r["tp1"], r["tp1_pct"], r["tp2"], r["tp2_pct"], r["risk_reward"],
+                r["v2_score"], r["setup_type"], r["entry_status"]
             )
             for r in final_results
         ]
@@ -440,33 +519,44 @@ def print_final_executive_report(final_picks: List[Dict[str, Any]]) -> None:
     if not final_picks:
         return
 
-    print("\n" + "=" * 130)
-    print("💎 REKOMENDASI FINAL SPOT SCALPING: GABUNGAN TEKNIKAL, PAUS, FUNDING RATE & AI")
-    print("=" * 130)
-    print(f"{'NO':<3} {'SIMBOL':<11} {'TEK':<4} {'FUNDING':<10} {'BERITA':<9} {'AKHIR':<6} {'REKOMENDASI':<34} {'KATALIS UTAMA AI'}")
-    print("-" * 130)
+    print("\n" + "=" * 145)
+    print("💎 REKOMENDASI FINAL SPOT SCALPING: GABUNGAN KRIPIKTO v2, TAKSONOMI PASAR & AI RISK GUARD")
+    print("=" * 145)
+    print(f"{'NO':<3} {'SIMBOL':<10} {'SETUP TYPE':<18} {'STATUS':<8} {'v2':<4} {'FUNDING':<9} {'BERITA':<9} {'AKHIR':<6} {'REKOMENDASI':<30} {'KATALIS UTAMA AI'}")
+    print("-" * 145)
 
     for i, r in enumerate(final_picks):
         sent_badge = f"{r['sentiment']} ({r['sentiment_score']:+.1f})"
         fr_str = f"{r.get('funding_rate', 0.0):+.3f}%"
+        setup_str = r.get("setup_type", "NO_SETUP")
+        stat_str = r.get("entry_status", "WAIT")
+        if stat_str == "READY":
+            stat_str = "🚀 RDY"
+        elif stat_str == "EXTENDED":
+            stat_str = "⚠️ EXT"
+        else:
+            stat_str = "⏳ WAIT"
+
         catalyst_short = r['catalyst']
-        if len(catalyst_short) > 48:
-            catalyst_short = catalyst_short[:45] + "..."
+        if len(catalyst_short) > 42:
+            catalyst_short = catalyst_short[:39] + "..."
 
-        print(f"{i+1:<3} {r['symbol']:<11} {r['tech_score']:<4} {fr_str:<10} {sent_badge:<9} {r['final_score']:<6} {r['recommendation']:<34} {catalyst_short}")
+        v2_val = r.get("v2_score", r.get("tech_score", 0))
 
-    print("=" * 130)
-    print("\n📋 TRADING PLAN SPOT SCALPING (TOP 3 PICKS - TARGET PROFIT +6.0%):")
+        print(f"{i+1:<3} {r['symbol']:<10} {setup_str:<18} {stat_str:<8} {v2_val:<4} {fr_str:<9} {sent_badge:<9} {r['final_score']:<6} {r['recommendation']:<30} {catalyst_short}")
+
+    print("=" * 145)
+    print("\n📋 TRADING PLAN SPOT SCALPING (TOP 3 PICKS - TARGET PROFIT ADAPTIF):")
     print("-" * 75)
     for i, r in enumerate(final_picks[:3]):
-        print(f"#{i+1} {r['symbol']} | Rekomendasi: {r['recommendation']}")
+        print(f"#{i+1} {r['symbol']} | Setup: {r.get('setup_type', '-')} | Status: {r.get('entry_status', '-')} | Rekomendasi: {r['recommendation']}")
         print(f"   Buy Area   : {r['buy_area']}")
         print(f"   Stop Loss  : ${r['stop_loss']} ({r['stop_loss_pct']}%)")
         print(f"   TP 1 (Scalp): ${r['tp1']} (+{r['tp1_pct']}%) -> Target Jual Otomatis!")
         print(f"   TP 2 (Ext) : ${r['tp2']} (+{r['tp2_pct']}%)")
         print(f"   Risk/Reward: {r['risk_reward']}")
         print(f"   Katalis AI : {r['catalyst']}\n")
-    print("=" * 130)
+    print("=" * 145)
     print(f"📁 Rekap JSON final tersimpan di: {FINAL_JSON_PATH}\n")
 
 
