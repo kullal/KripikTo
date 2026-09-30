@@ -246,9 +246,13 @@ def fetch_subsequent_klines(
         if resp.status_code == 200:
             raw = resp.json()
             rows = []
+            now_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
             for k in raw:
                 op_t = int(k[0])
                 cl_t = int(k[6])
+                # Only closed candles are valid for historical outcome evaluation.
+                if cl_t > now_ms:
+                    continue
                 dt_str = datetime.datetime.fromtimestamp(
                     op_t / 1000, tz=datetime.timezone.utc
                 ).strftime("%Y-%m-%d %H:%M:%S")
@@ -343,10 +347,26 @@ def evaluate_single_signal(
             # Order terisi jika harga Low lilin menembus batas atas area beli
             if c_low <= buy_high:
                 is_filled = 1
-                fill_price = min(c_open, buy_high) if c_open <= buy_high else buy_high
+                # Use the scanner's declared entry price. Do not infer an intrabar fill price.
+                fill_price = entry_p if entry_p > 0 else buy_high
                 fill_time_str = c["datetime_utc"]
                 fill_dt = c_dt
                 fill_candle_idx = idx
+
+                # OHLC cannot reveal whether fill happened before TP/SL on this candle.
+                # Mark the event ambiguous instead of inventing the intrabar order.
+                same_candle_tp = (tp1 > 0 and c_high >= tp1) or (tp2 > 0 and c_high >= tp2)
+                same_candle_sl = sl > 0 and c_low <= sl
+                if same_candle_tp and same_candle_sl:
+                    result = "AMBIGUOUS"
+                    result_time = c["datetime_utc"]
+                    dur_hours = 0.0
+                    dur_candles = 0
+                    break
+
+                # This candle only proves that the order was touched.
+                # MFE/MAE/TP/SL evaluation starts on the next closed candle.
+                continue
             else:
                 elapsed_since_scan = (c_dt - dt_scan).total_seconds() / 3600.0
                 if elapsed_since_scan >= fill_timeout_hours:
