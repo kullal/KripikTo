@@ -77,6 +77,19 @@ class ScannerDataIntegrityTests(unittest.TestCase):
         self.assertEqual(outcomes[0]["entry_status"], "WAIT")
         self.assertEqual(calls, 0)
 
+    def test_archived_symbols_outside_current_universe_are_not_validated(self):
+        mutation = """INSERT INTO klines_history (symbol, interval, open_time,
+            close_time, datetime_utc, open, high, low, close, volume, quote_volume,
+            taker_buy_volume, is_closed, fetched_at)
+            SELECT 'OLDUSDT', interval, open_time, NULL, datetime_utc, open,
+                high, low, close, volume, quote_volume, taker_buy_volume, 1, NULL
+            FROM klines_history WHERE symbol='TESTUSDT'"""
+        picks, _, report, _, _, _ = self.run_scan(mutation)
+        self.assertEqual(picks.iloc[0].entry_status, "TRIGGERED")
+        for label in ("structure_4h", "momentum_1h"):
+            self.assertEqual(report["checks"][label]["accepted_symbols"], 1)
+            self.assertNotIn("OLDUSDT", report["checks"][label]["rejected"])
+
     def test_invalid_momentum_cannot_score_or_trigger(self):
         _, saved, report, _, _, calls = self.run_scan("UPDATE klines_history SET fetched_at=NULL WHERE symbol='TESTUSDT' AND interval='1h'")
         self.assertEqual(saved[0]["momentum_score"], 0)

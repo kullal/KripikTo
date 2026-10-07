@@ -339,6 +339,12 @@ def run_scanner(
             conn
         )
 
+    # Validate this scan's universe; archived symbols are not current candidates.
+    # BTC benchmark quality is checked separately above.
+    current_symbols = set(df_summary["symbol"])
+    df_klines = df_klines[df_klines["symbol"].isin(current_symbols)].copy()
+    df_1h = df_1h[df_1h["symbol"].isin(current_symbols)].copy()
+
     df_klines, structure_issues = validate_closed_candles(
         df_klines, interval, STRUCTURE_MIN_CANDLES, now_ms=validation_time,
     )

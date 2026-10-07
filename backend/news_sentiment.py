@@ -292,9 +292,10 @@ Kembalikan jawaban HANYA berupa JSON valid dengan skema berikut:
         }
     }
 
-    # Model prioritas Gemini Flash untuk fallback otomatis jika satu model sibuk
+    # Use the configured model and retain a safe diagnostic on failure.
     models_to_try = [os.environ.get("GEMINI_MODEL", "gemini-flash-latest")]
     prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    failure_reason = "UNKNOWN_ERROR"
 
     for model_name in models_to_try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
@@ -317,15 +318,21 @@ Kembalikan jawaban HANYA berupa JSON valid dengan skema berikut:
                 parsed = validate_sentiment_response(json.loads(text_resp))
                 return dict(parsed, news_status="AVAILABLE", model=model_name, prompt_hash=prompt_hash)
             elif resp.status_code in (429, 503):
+                failure_reason = f"HTTP_{resp.status_code}"
                 time.sleep(1.5)
                 continue
             else:
-                print(f"[!] Gemini ({model_name}) status {resp.status_code}: {resp.text[:60]}")
+                failure_reason = f"HTTP_{resp.status_code}"
         except Exception as e:
+            # Exception messages may contain request URLs with the API key.
+            prefix = "REQUEST_FAILED" if isinstance(e, requests.RequestException) else "INVALID_RESPONSE"
+            failure_reason = f"{prefix}:{type(e).__name__}"
             time.sleep(1)
             continue
 
-    result = unavailable_sentiment("MODEL_FAILED", "Model sentimen tidak tersedia atau respons tidak valid; Risk Guard belum terverifikasi.")
+    print(f"[!] Gemini gagal untuk {symbol}: {failure_reason}")
+    result = unavailable_sentiment("MODEL_FAILED", f"Gemini gagal ({failure_reason}); Risk Guard belum terverifikasi.")
+    result["model"] = model_name
     result["prompt_hash"] = prompt_hash
     return result
 
@@ -618,8 +625,11 @@ def print_final_executive_report(final_picks: List[Dict[str, Any]]) -> None:
     print("-" * 145)
 
     for i, r in enumerate(final_picks):
-        sent_badge = f"{r['sentiment']} ({r['sentiment_score']:+.1f})"
-        fr_str = f"{r.get('funding_rate', 0.0):+.3f}%"
+        sentiment_score = r.get("sentiment_score")
+        score_text = f"{sentiment_score:+.1f}" if sentiment_score is not None else "N/A"
+        sent_badge = f"{r['sentiment']} ({score_text})"
+        funding_rate = r.get("funding_rate")
+        fr_str = f"{funding_rate:+.3f}%" if funding_rate is not None else "N/A"
         setup_str = r.get("setup_type", "NO_SETUP")
         stat_str = r.get("entry_status", "WAIT")
         if stat_str == "TRIGGERED":
@@ -648,7 +658,7 @@ def print_final_executive_report(final_picks: List[Dict[str, Any]]) -> None:
         print(f"#{i+1} {r['symbol']} | Setup: {r.get('setup_type', '-')} | Status: {r.get('entry_status', '-')} | Rekomendasi: {r['recommendation']}")
         print(f"   Buy Area   : {r['buy_area']}")
         print(f"   Stop Loss  : ${r['stop_loss']} ({r['stop_loss_pct']}%)")
-        print(f"   TP 1 (Scalp): ${r['tp1']} (+{r['tp1_pct']}%) -> Target Jual Otomatis!")
+        print(f"   TP 1 (Scalp): ${r['tp1']} (+{r['tp1_pct']}%)")
         print(f"   TP 2 (Ext) : ${r['tp2']} (+{r['tp2_pct']}%)")
         print(f"   Risk/Reward: {r['risk_reward']}")
         print(f"   Katalis AI : {r['catalyst']}\n")

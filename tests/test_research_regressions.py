@@ -285,6 +285,24 @@ class CalibrationConsistencyTests(unittest.TestCase):
 
 
 class NewsIntegrityTests(unittest.TestCase):
+    def test_final_report_handles_unknown_news_and_missing_funding(self):
+        row = dict(candidate(), **news.unavailable_sentiment("NO_NEWS", "Tidak ada berita relevan."),
+                   funding_rate=None, final_score=90,
+                   recommendation="NEWS_UNVERIFIED (Risk Guard belum tersedia)")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            news.print_final_executive_report([row])
+        self.assertIn("UNKNOWN (N/A)", output.getvalue())
+        self.assertIn("NEWS_UNVERIFIED", output.getvalue())
+        self.assertNotIn("Target Jual Otomatis", output.getvalue())
+
+    def test_final_report_preserves_valid_neutral_score(self):
+        row = dict(candidate(), **self.valid(), final_score=95, recommendation="TRIGGERED_BUY")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            news.print_final_executive_report([row])
+        self.assertIn("NEUTRAL (+0.0)", output.getvalue())
+
     def valid(self):
         return dict(sentiment="NEUTRAL", sentiment_score=0.0, impact_level="RENDAH",
                     catalyst="Tidak ada katalis kuat.", crypto_risk=False)
@@ -314,6 +332,24 @@ class NewsIntegrityTests(unittest.TestCase):
             value = news.analyze_sentiment_with_gemini("TESTUSDT", items, "key")
         self.assertEqual(value["news_status"], "MODEL_FAILED")
         self.assertIsNone(value["sentiment_score"])
+
+    def test_model_quota_failure_has_a_safe_diagnostic(self):
+        items = [{"source": "Media", "title": "TEST upgrade", "pub_date": "today"}]
+        output = io.StringIO()
+        with patch.object(news.requests, "post", return_value=Mock(status_code=429)), patch.object(news.time, "sleep"), contextlib.redirect_stdout(output):
+            value = news.analyze_sentiment_with_gemini("TESTUSDT", items, "private-test-key")
+        self.assertIn("HTTP_429", value["catalyst"])
+        self.assertIn("HTTP_429", output.getvalue())
+        self.assertNotIn("private-test-key", output.getvalue())
+
+    def test_request_error_diagnostic_does_not_expose_key_in_url(self):
+        items = [{"source": "Media", "title": "TEST upgrade", "pub_date": "today"}]
+        output = io.StringIO()
+        error = news.requests.ConnectionError("https://example.com?key=private-test-key")
+        with patch.object(news.requests, "post", side_effect=error), patch.object(news.time, "sleep"), contextlib.redirect_stdout(output):
+            value = news.analyze_sentiment_with_gemini("TESTUSDT", items, "private-test-key")
+        self.assertIn("REQUEST_FAILED:ConnectionError", value["catalyst"])
+        self.assertNotIn("private-test-key", output.getvalue() + value["catalyst"])
 
     def test_news_keeps_original_identity_and_unknown_cannot_emit_buy(self):
         row = candidate(datetime.datetime.now(UTC).replace(microsecond=0))
