@@ -242,10 +242,10 @@ def fetch_24h_summary(top_n: int = 500, db_path: str = DB_PATH) -> pd.DataFrame:
 
         try:
             quote_vol = float(item.get("quoteVolume", 0.0))
-            taker_quote = float(item.get("takerBuyQuoteAssetVolume", 0.0))
+            taker_quote = float(item["takerBuyQuoteAssetVolume"]) if "takerBuyQuoteAssetVolume" in item else None
             
             # Hitung Taker Buy Ratio (Whale/Smart Money Inflow)
-            taker_ratio = (taker_quote / quote_vol * 100.0) if quote_vol > 0 else 50.0
+            taker_ratio = (taker_quote / quote_vol * 100.0) if taker_quote is not None and quote_vol > 0 else None
 
             filtered.append({
                 "symbol": sym,
@@ -257,7 +257,7 @@ def fetch_24h_summary(top_n: int = 500, db_path: str = DB_PATH) -> pd.DataFrame:
                 "quote_volume": quote_vol,
                 "taker_buy_base_volume": float(item.get("takerBuyBaseAssetVolume", 0.0)),
                 "taker_buy_quote_volume": taker_quote,
-                "taker_buy_ratio": round(taker_ratio, 2),
+                "taker_buy_ratio": round(taker_ratio, 2) if taker_ratio is not None else None,
                 "trades_count": int(item.get("count", 0)),
                 "updated_at": now_utc
             })

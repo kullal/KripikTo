@@ -1,551 +1,306 @@
-"""
-backend/calibration_lab.py
-Laboratorium Eksperimen & Kalibrasi Empiris Kuantitatif (KripikTo v2 Fase 6):
-Prinsip: "Measurement before optimization" & "Bobot/threshold adalah VARIABEL, bukan dogma"
+"""Chronological candle replay, purged validation and finite-capital experiments.
 
-Metodologi Ilmiah yang Diterapkan:
-1. Time-Series Train/Test Split (Out-of-Sample Validation):
-   - 70% data awal kronologis = Training Set (In-Sample Calibration)
-   - 30% data terbaru kronologis = Testing Set (Out-of-Sample Evaluation)
-   - Mencegah Overfitting & Lookahead Bias.
-2. Dynamic ATR Grid Search Simulation:
-   - Menguji kombinasi Multiplier ATR Dinamis nyata (TP: 1.2x - 3.0x ATR, SL: 1.0x - 2.0x ATR)
-   - Membandingkannya secara langsung dengan Static Percentage (+6% / -4.5% baseline v1).
-3. Kalibrasi Bobot 5 Pilar Matematis (Feature-Driven Weighting):
-   - Mengukur korelasi dan Edge Spread tiap pilar terhadap MFE pada Training Set.
-   - Menghitung distribusi bobot 100 poin secara proporsional terhadap daya prediksi empiris.
-4. Evaluasi Kejadian Ambigu (Same-Candle Flash Spike):
-   - Tidak mengasumsikan TP tercapai lebih dulu jika SL juga tersentuh di lilin yang sama.
-5. Menyimpan Parameter Terkalibrasi ke calibrated_config.json.
+Legacy MFE/MAE summaries are diagnostics, never counterfactual execution evidence.
 """
-
-import sys
-import json
-import sqlite3
 import argparse
+import datetime
+import json
+import math
+import sqlite3
 from pathlib import Path
-from typing import Dict, List, Any, Tuple, Optional
+from typing import Any, Dict, Optional, Tuple
+
 import pandas as pd
-import numpy as np
 
-# Pastikan output utf-8 aman di terminal Windows
-if sys.platform == "win32" and sys.stdout.encoding.lower() != "utf-8":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
+try:
+    from backend.feature_engine import BASE_WEIGHTS, SCORING_VERSION, compose_quant_score, calculate_dynamic_tp_sl
+    from backend.outcome_tracker import init_outcome_tracker_db, evaluate_single_signal
+    from backend.research_utils import database, DEFAULT_COSTS, FORWARD_HOURS, utc_time, read_forward_candles, complete_forward_window, portfolio_metrics
+except ImportError:
+    from feature_engine import BASE_WEIGHTS, SCORING_VERSION, compose_quant_score, calculate_dynamic_tp_sl
+    from outcome_tracker import init_outcome_tracker_db, evaluate_single_signal
+    from research_utils import database, DEFAULT_COSTS, FORWARD_HOURS, utc_time, read_forward_candles, complete_forward_window, portfolio_metrics
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR = Path(__file__).resolve().parent / "data"
 DB_PATH = str(DATA_DIR / "kripto.db")
 CALIBRATED_CONFIG_PATH = str(DATA_DIR / "calibrated_config.json")
+PLAN_DEFAULTS = {"target_profit_1_pct": 4.5, "stop_loss_pct": -4.8,
+                 "tp_atr_multiplier": 1.6, "sl_atr_multiplier": 1.25}
+MIN_TRAIN, MIN_EVALUATION = 20, 10
 
 
-def load_dataset(db_path: str = DB_PATH, only_filled: bool = True) -> pd.DataFrame:
-    """Membaca riwayat sinyal dan metrik empiris MFE/MAE dari SQLite, digabung dengan fitur scan."""
+def load_dataset(db_path=DB_PATH, only_filled=False):
+    """Use canonical, quality-checked triggered scans with complete forward candles."""
     try:
         from backend.scanner import init_scanner_db
-        init_scanner_db(db_path)
-    except Exception:
-        pass
-    with sqlite3.connect(db_path) as conn:
-        query = """
-            SELECT 
-                o.*,
-                COALESCE(s.score, o.v1_score) as scan_score,
-                s.rsi14 as scan_rsi14,
-                s.vol_ratio as scan_vol_ratio,
-                s.taker_buy_ratio as scan_taker_ratio,
-                s.funding_rate as scan_funding_rate,
-                s.open_interest_m as scan_oi_m,
-                s.price_change_pct as scan_change_24h,
-                s.roc_1h as scan_roc_1h,
-                s.acceleration_1h as scan_accel_1h,
-                s.atr_expansion as scan_atr_expansion,
-                s.delta_oi_1h as scan_delta_oi_1h,
-                s.delta_funding_1h as scan_delta_funding_1h
-            FROM signal_outcomes o
-            LEFT JOIN scan_results s 
-                ON o.symbol = s.symbol AND o.scan_time = s.scan_time
-        """
-        if only_filled:
-            query += " WHERE o.is_filled = 1 AND (o.mfe_pct IS NOT NULL OR o.return_24h_pct IS NOT NULL)"
-        query += " ORDER BY o.scan_time ASC"  # Kronologis dari terlama ke terbaru
-        df = pd.read_sql(query, conn)
-    return df
+    except ImportError:
+        from scanner import init_scanner_db
+    init_scanner_db(db_path)
+    init_outcome_tracker_db(db_path)
+    with database(db_path) as conn:
+        df = pd.read_sql("""
+            SELECT s.*, o.forward_complete FROM scan_results s
+            JOIN signal_outcomes o ON o.scan_time=s.scan_time AND o.symbol=s.symbol
+            WHERE s.entry_status='TRIGGERED' AND s.data_quality_status='OK'
+            AND s.scoring_version=? ORDER BY s.scan_time, s.symbol
+        """, conn, params=(SCORING_VERSION,))
+        paths = []
+        for row in df.to_dict("records"):
+            candles = read_forward_candles(conn, row["scan_time"], row["symbol"])
+            paths.append(candles if complete_forward_window(row["scan_time"], candles) else None)
+    df["forward_candles"] = paths
+    df = df[df.forward_candles.notna()].copy()
+    df["label_end"] = pd.to_datetime(df.scan_time, utc=True) + pd.Timedelta(hours=FORWARD_HOURS + 1)
+    if only_filled:
+        df = df[df.apply(lambda r: evaluate_single_signal(r.to_dict(), candles=r.forward_candles)["is_filled"] == 1, axis=1)].copy()
+    return df.reset_index(drop=True)
 
 
-def split_train_test(df: pd.DataFrame, train_ratio: float = 0.70) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Membagi dataset secara time-series kronologis tanpa pengacakan (Walk-Forward foundation):
-    - 70% awal: In-Sample Training (pencarian parameter & kalibrasi bobot)
-    - 30% akhir: Out-of-Sample Test (pengujian performa murni)
-    """
-    # OOS validation is not meaningful on a tiny dataset.
-    if len(df) < 30:
+def _purge_before(frame, boundary):
+    label_end = pd.to_datetime(frame["label_end"], utc=True) if "label_end" in frame else pd.to_datetime(frame.scan_time, utc=True) + pd.Timedelta(hours=FORWARD_HOURS + 1)
+    return frame[label_end < boundary].copy().reset_index(drop=True)
+
+
+def split_train_test(df, train_ratio=0.70):
+    """Keep a timestamp group together and purge overlapping forward labels."""
+    if df.empty or not 0 < train_ratio < 1:
         return pd.DataFrame(), pd.DataFrame()
-
-    split_idx = int(len(df) * train_ratio)
-    if split_idx < 20 or (len(df) - split_idx) < 10:
+    times = pd.to_datetime(df.scan_time, utc=True)
+    groups = sorted(times.unique())
+    index = int(len(groups) * train_ratio)
+    if index < 1 or index >= len(groups):
         return pd.DataFrame(), pd.DataFrame()
-    df_train = df.iloc[:split_idx].copy().reset_index(drop=True)
-    df_test = df.iloc[split_idx:].copy().reset_index(drop=True)
-    return df_train, df_test
+    boundary = groups[index]
+    train = _purge_before(df[times < boundary], boundary)
+    test = df[times >= boundary].copy().reset_index(drop=True)
+    if len(train) < MIN_TRAIN or len(test) < MIN_EVALUATION:
+        return pd.DataFrame(), pd.DataFrame()
+    return train, test
 
 
-def simulate_trade_outcome(
-    mfe_pct: float,
-    mae_pct: float,
-    target_tp_pct: float,
-    stop_loss_pct: float,
-    actual_result: Optional[str] = None,
-    ret_12h_pct: Optional[float] = None
-) -> Tuple[str, float]:
-    """
-    Mensimulasikan hasil trade historis pada level TP dan SL tertentu:
-    - Menghormati kejadian AMBIGUOUS (jika lilin menyentuh TP dan SL bersamaan).
-    - Menghindari lookahead bias.
-    """
-    sl_dist = -abs(stop_loss_pct)
-    tp_dist = abs(target_tp_pct)
-
-    hit_tp = (mfe_pct >= tp_dist)
-    hit_sl = (mae_pct <= sl_dist)
-
-    if actual_result == "AMBIGUOUS":
-        # Sesuai spesifikasi Fase 3.5: Jangan mengarang urutan kejadian
-        return "AMBIGUOUS", sl_dist * 0.5
-
-    if hit_tp and not hit_sl:
-        return "TP_HIT", tp_dist
-    elif hit_sl and not hit_tp:
-        return "SL_HIT", sl_dist
-    elif hit_tp and hit_sl:
-        # Kedua level tercapai selama durasi posisi:
-        # Pendekatan konservatif kuantitatif: jika MAE dalam, anggap SL tersapu dulu
-        if abs(mae_pct) >= abs(sl_dist * 1.15):
-            return "SL_HIT", sl_dist
-        else:
-            return "TP_HIT", tp_dist
-    else:
-        # Posisi timeout (Time-Stop)
-        fallback_ret = float(ret_12h_pct) if pd.notnull(ret_12h_pct) else 0.0
-        return "TIMEOUT", fallback_ret
+def split_train_validation_test(df):
+    train, rest = split_train_test(df, 0.60)
+    if train.empty:
+        return train, pd.DataFrame(), pd.DataFrame()
+    # Validation/test both require ten records, with complete timestamp groups.
+    times = pd.to_datetime(rest.scan_time, utc=True)
+    groups = sorted(times.unique())
+    if len(groups) < 2:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    boundary = groups[len(groups) // 2]
+    validation = _purge_before(rest[times < boundary], boundary)
+    test = rest[times >= boundary].copy().reset_index(drop=True)
+    if len(validation) < MIN_EVALUATION or len(test) < MIN_EVALUATION:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    return train, validation, test
 
 
-def evaluate_configuration_dynamic_atr(
-    df: pd.DataFrame,
-    tp_mult: float,
-    sl_mult: float
-) -> Dict[str, Any]:
-    """
-    Menghitung metrik performa portofolio untuk kombinasi Multiplier ATR Dinamis:
-    TP = tp_mult * (ATR / Entry), SL = -sl_mult * (ATR / Entry).
-    """
-    results = []
-    returns = []
-
-    for _, row in df.iterrows():
-        mfe = float(row.get("mfe_pct") or 0.0)
-        mae = float(row.get("mae_pct") or 0.0)
-        ret12 = row.get("return_12h_pct")
-        act_res = row.get("result")
-
-        entry_p = float(row.get("entry_price") or row.get("fill_price") or 1.0)
-        atr_val = float(row.get("atr14") or (entry_p * 0.032))
-        if atr_val <= 0 or entry_p <= 0:
-            atr_pct = 3.2
-        else:
-            atr_pct = (atr_val / entry_p) * 100.0
-
-        # Batas minimum logis agar tidak terkena fee Binance (min TP 3.0%, min SL -3.2%)
-        tp_target_pct = max(3.0, round(tp_mult * atr_pct, 2))
-        sl_target_pct = -max(3.2, round(sl_mult * atr_pct, 2))
-
-        outcome, ret_realized = simulate_trade_outcome(
-            mfe_pct=mfe,
-            mae_pct=mae,
-            target_tp_pct=tp_target_pct,
-            stop_loss_pct=sl_target_pct,
-            actual_result=act_res,
-            ret_12h_pct=ret12
-        )
-        results.append(outcome)
-        returns.append(ret_realized)
-
-    total_trades = len(results)
-    if total_trades == 0:
-        return {}
-
-    tp_count = results.count("TP_HIT")
-    sl_count = results.count("SL_HIT")
-    to_count = results.count("TIMEOUT")
-    amb_count = results.count("AMBIGUOUS")
-
-    win_rate = (tp_count / total_trades) * 100.0
-    loss_rate = (sl_count / total_trades) * 100.0
-    timeout_rate = (to_count / total_trades) * 100.0
-
-    gains = [r for r in returns if r > 0]
-    losses = [abs(r) for r in returns if r < 0]
-
-    sum_gains = sum(gains)
-    sum_losses = sum(losses)
-    net_return = sum_gains - sum_losses
-
-    avg_win = (sum_gains / len(gains)) if gains else 0.0
-    avg_loss = (sum_losses / len(losses)) if losses else 1.0
-
-    profit_factor = (sum_gains / sum_losses) if sum_losses > 0 else (99.0 if sum_gains > 0 else 0.0)
-
-    # Expectancy ($ per $1 resiko)
-    p_win = win_rate / 100.0
-    p_loss = loss_rate / 100.0
-    expectancy = (p_win * avg_win) - (p_loss * avg_loss)
-
-    # Kelly Criterion %
-    rr_ratio = (avg_win / avg_loss) if avg_loss > 0 else 1.0
-    kelly = p_win - ((1.0 - p_win) / rr_ratio) if rr_ratio > 0 else 0.0
-
-    return {
-        "tp_mult": tp_mult,
-        "sl_mult": sl_mult,
-        "total_trades": total_trades,
-        "win_rate": round(win_rate, 1),
-        "loss_rate": round(loss_rate, 1),
-        "timeout_rate": round(timeout_rate, 1),
-        "ambiguous_count": amb_count,
-        "profit_factor": round(profit_factor, 2),
-        "expectancy": round(expectancy, 2),
-        "kelly_pct": round(max(0.0, kelly * 100.0), 1),
-        "net_return_pct": round(net_return, 1),
-        "avg_win": round(avg_win, 2),
-        "avg_loss": round(avg_loss, 2)
-    }
-
-
-def run_dynamic_atr_grid_search(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Grid Search simulasi pada Multiplier ATR Dinamis (Spesifikasi Fase 6.3):
-    - TP Multiplier: 1.2x, 1.5x, 1.8x, 2.0x, 2.4x, 2.8x, 3.2x ATR
-    - SL Multiplier: 1.0x, 1.2x, 1.4x, 1.6x, 1.8x, 2.0x ATR
-    """
-    tp_candidates = [1.2, 1.5, 1.8, 2.0, 2.4, 2.8, 3.2]
-    sl_candidates = [1.0, 1.2, 1.4, 1.6, 1.8, 2.0]
-
-    grid_results = []
-    for tp in tp_candidates:
-        for sl in sl_candidates:
-            metrics = evaluate_configuration_dynamic_atr(df, tp_mult=tp, sl_mult=sl)
-            if metrics:
-                grid_results.append(metrics)
-
-    df_grid = pd.DataFrame(grid_results)
-    if not df_grid.empty:
-        df_grid = df_grid.sort_values(by=["profit_factor", "expectancy", "win_rate"], ascending=[False, False, False]).reset_index(drop=True)
-    return df_grid
-
-
-def analyze_feature_correlations(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Mengukur signifikansi statistik (korelasi Pearson) antara subskor/indikator
-    dengan MFE (puncak keuntungan).
-    """
-    feature_meta = [
-        ("scan_score", "Skor Teknikal"),
-        ("scan_rsi14", "RSI 14 (Momentum)"),
-        ("scan_vol_ratio", "Volume Ratio 4H"),
-        ("scan_taker_ratio", "Taker Buy (Paus)"),
-        ("scan_funding_rate", "Funding Rate"),
-        ("scan_change_24h", "24h Return %"),
-        ("structure_score", "Pilar 1: Struktur 4H"),
-        ("momentum_score", "Pilar 2: Momentum 1H"),
-        ("flow_score", "Pilar 3: Whale Flow"),
-        ("derivative_score", "Pilar 4: Derivatif"),
-        ("v2_score", "Skor Komposit MTF v2")
-    ]
-
-    if "mfe_pct" not in df.columns:
-        return pd.DataFrame()
-
-    records = []
-    for col, label in feature_meta:
-        if col not in df.columns or df[col].notnull().sum() < 5:
+def walk_forward_splits(df, folds=3):
+    """Expanding training windows with disjoint, purged chronological tests."""
+    if df.empty:
+        return []
+    times = pd.to_datetime(df.scan_time, utc=True)
+    groups = sorted(times.unique())
+    first = len(groups) // 2
+    boundaries = [first + (len(groups) - first) * i // folds for i in range(folds + 1)]
+    result = []
+    for left, right in zip(boundaries, boundaries[1:]):
+        if left >= right or left >= len(groups):
             continue
-        series_feat = pd.to_numeric(df[col], errors="coerce")
-        series_mfe = pd.to_numeric(df["mfe_pct"], errors="coerce")
-        valid_idx = series_feat.notnull() & series_mfe.notnull()
-
-        if valid_idx.sum() >= 5:
-            corr_mfe = series_feat[valid_idx].corr(series_mfe[valid_idx])
-            med_val = series_feat[valid_idx].median()
-            high_group_mfe = series_mfe[valid_idx & (series_feat >= med_val)].mean()
-            low_group_mfe = series_mfe[valid_idx & (series_feat < med_val)].mean()
-            delta_edge = high_group_mfe - low_group_mfe
-
-            records.append({
-                "kode": col,
-                "fitur": label,
-                "korelasi_mfe": round(corr_mfe, 3) if pd.notnull(corr_mfe) else 0.0,
-                "mfe_high_group": round(high_group_mfe, 2) if pd.notnull(high_group_mfe) else 0.0,
-                "mfe_low_group": round(low_group_mfe, 2) if pd.notnull(low_group_mfe) else 0.0,
-                "edge_spread": round(delta_edge, 2) if pd.notnull(delta_edge) else 0.0
-            })
-
-    df_corr = pd.DataFrame(records)
-    if not df_corr.empty:
-        df_corr = df_corr.sort_values(by="edge_spread", ascending=False).reset_index(drop=True)
-    return df_corr
+        boundary = groups[left]
+        train = _purge_before(df[times < boundary], boundary)
+        mask = times >= boundary
+        if right < len(groups):
+            mask &= times < groups[right]
+        test = df[mask].copy()
+        if len(train) >= MIN_TRAIN and len(test) >= MIN_EVALUATION:
+            result.append((train, test))
+    return result
 
 
-def _evaluate_weight_set(df: pd.DataFrame, weights: Dict[str, int]) -> Dict[str, float]:
-    """Evaluate candidate pillar weights against training outcomes."""
-    cols = {
-        "structure": ("structure_score", 25),
-        "momentum": ("momentum_score", 30),
-        "flow": ("flow_score", 20),
-        "derivatives": ("derivative_score", 15),
-    }
-    if df.empty or any(col not in df.columns for col, _ in cols.values()):
-        return {}
+def simulate_trade_outcome(mfe_pct, mae_pct, target_tp_pct, stop_loss_pct,
+                           actual_result=None, ret_12h_pct=None):
+    """Compatibility guard: extrema cannot identify counterfactual trade outcomes."""
+    raise ValueError("MFE/MAE cannot reconstruct execution order; use forward candle replay.")
 
-    x = df.copy()
-    score = 0.0
-    for name, (col, baseline_max) in cols.items():
-        vals = pd.to_numeric(x[col], errors="coerce").fillna(0.0)
-        score += (vals / float(baseline_max)) * float(weights[name])
-    x["_calibrated_score"] = score
 
-    cutoff = x["_calibrated_score"].quantile(0.70)
-    selected = x[x["_calibrated_score"] >= cutoff].copy()
+def select_candidates(df, weights=None, min_score=40, top_n=15, score_mode="v2"):
+    if df.empty:
+        return df.copy()
+    weights = BASE_WEIGHTS if weights is None else weights
+    selected = df.copy()
+    if score_mode == "v1":
+        selected["selection_score"] = pd.to_numeric(selected.v1_score, errors="coerce")
+    else:
+        selected["selection_score"] = selected.apply(lambda r: compose_quant_score({
+            "structure": r.structure_score, "momentum": r.momentum_score,
+            "flow": r.flow_score, "derivatives": r.derivative_score},
+            weights, r.get("score_penalty", 0)), axis=1)
+    selected = selected[selected.selection_score >= min_score]
+    # Same fixed score gate and top-N policy as scanner, within stored candidates.
+    selected = selected.sort_values(["scan_time", "selection_score", "taker_buy_ratio", "quote_vol_m"],
+                                    ascending=[True, False, False, False])
+    return selected.groupby("scan_time", sort=False).head(top_n).copy()
+
+
+def evaluate_configuration_dynamic_atr(df, tp_mult, sl_mult, weights=None, costs=None,
+                                       score_mode="v2", config=None):
+    selected = select_candidates(df, weights, score_mode=score_mode)
     if selected.empty:
         return {}
-
-    results = selected["result"].astype(str)
-    success_rate = results.isin(["TP1_HIT", "TP2_HIT"]).mean() * 100.0
-    timeout_rate = (results == "TIMEOUT").mean() * 100.0
-    avg_mfe = pd.to_numeric(selected["mfe_pct"], errors="coerce").mean()
-    avg_mae = pd.to_numeric(selected["mae_pct"], errors="coerce").mean()
-    objective = success_rate - 0.35 * timeout_rate + 0.10 * float(avg_mfe or 0.0) + 0.05 * float(avg_mae or 0.0)
-
-    return {
-        "objective": float(objective),
-        "success_rate": float(success_rate),
-        "timeout_rate": float(timeout_rate),
-        "avg_mfe": float(avg_mfe or 0.0),
-        "avg_mae": float(avg_mae or 0.0),
-        "selected_count": int(len(selected))
+    plan = dict(PLAN_DEFAULTS)
+    plan.update(config or {})
+    plan.update(tp_atr_multiplier=float(tp_mult), sl_atr_multiplier=float(sl_mult))
+    evaluated = []
+    for row in selected.to_dict("records"):
+        if not isinstance(row.get("forward_candles"), list) or not complete_forward_window(row["scan_time"], row["forward_candles"]):
+            raise ValueError("A complete fixed forward candle window is required.")
+        entry = float(row["entry_price"])
+        support = float(row["support_level"])
+        atr = float(row["atr14"])
+        dec = 8 if float(row["last_price"]) < 0.01 else (6 if float(row["last_price"]) < 1 else 4)
+        targets = calculate_dynamic_tp_sl(entry, support, atr, dec=dec, config=plan)
+        signal = dict(row, **targets)
+        outcome = evaluate_single_signal(signal, candles=row["forward_candles"], costs=costs)
+        if outcome["result"] == "PENDING":
+            raise ValueError("Incomplete trade despite a forward window.")
+        evaluated.append(outcome)
+    portfolio = portfolio_metrics(evaluated)
+    filled = [r for r in evaluated if r["is_filled"]]
+    resolved = [r for r in filled if r["net_return_pct"] is not None]
+    amb = sum(r["result"] == "AMBIGUOUS" for r in evaluated)
+    denominator = len(resolved)
+    metrics = {
+        "tp_mult": tp_mult, "sl_mult": sl_mult, "total_trades": len(selected),
+        "filled_trades": len(filled), "fill_rate": len(filled) / len(selected) * 100,
+        "win_rate": sum(r["result"] in ("TP1_HIT", "TP2_HIT") for r in resolved) / denominator * 100 if denominator else 0,
+        "loss_rate": sum(r["result"] == "SL_HIT" for r in resolved) / denominator * 100 if denominator else 0,
+        "timeout_rate": sum(r["result"] == "TIMEOUT" for r in resolved) / denominator * 100 if denominator else 0,
+        "ambiguous_count": amb, "resolved_trades": denominator,
+        "avg_mfe": sum(r["mfe_pct"] for r in filled) / len(filled) if filled else 0,
+        "avg_mae": sum(r["mae_pct"] for r in filled) / len(filled) if filled else 0,
+        "costs": DEFAULT_COSTS if costs is None else costs,
+        "scope": "stored triggered candidate pool; excludes news; not a full-universe backtest",
+        "plan": plan, **portfolio,
     }
+    # Unknown executions are never converted into synthetic returns.
+    metrics["eligible_for_selection"] = bool(not amb and portfolio["portfolio_complete"] and denominator)
+    return metrics
 
 
-def optimize_pillar_weights(df_train: pd.DataFrame, df_corr: pd.DataFrame) -> Dict[str, int]:
-    """
-    Empirically test candidate weights on training outcomes.
-    News stays at 10 until historical news scores are available in snapshots.
-    """
-    if len(df_train) < 20:
-        return {"structure": 25, "momentum": 30, "flow": 20, "derivatives": 15, "news": 10}
+def run_dynamic_atr_grid_search(df, weights=None, costs=None):
+    trials = []
+    for tp in (1.2, 1.5, 1.8, 2.0, 2.4, 2.8, 3.2):
+        for sl in (1.0, 1.2, 1.4, 1.6, 1.8, 2.0):
+            metrics = evaluate_configuration_dynamic_atr(df, tp, sl, weights, costs)
+            if metrics and metrics["eligible_for_selection"]:
+                trials.append(metrics)
+    return pd.DataFrame(trials).sort_values(["portfolio_return_pct", "expectancy"], ascending=False).reset_index(drop=True) if trials else pd.DataFrame()
 
+
+def optimize_pillar_weights(df_train, df_corr=None, plan=None, costs=None):
     best = None
-    for structure in range(15, 36, 5):
-        for momentum in range(20, 41, 5):
-            for flow in range(10, 26, 5):
-                derivatives = 90 - structure - momentum - flow
-                if not 10 <= derivatives <= 25:
+    plan = PLAN_DEFAULTS if plan is None else plan
+    for structure in (20, 25, 30):
+        for momentum in (25, 30, 35):
+            for flow in (15, 20, 25):
+                derivative = 90 - structure - momentum - flow
+                if not 10 <= derivative <= 25:
                     continue
-                weights = {
-                    "structure": structure,
-                    "momentum": momentum,
-                    "flow": flow,
-                    "derivatives": derivatives,
-                    "news": 10
-                }
-                metrics = _evaluate_weight_set(df_train, weights)
-                if not metrics:
-                    continue
-                key = (metrics["objective"], metrics["success_rate"], -metrics["timeout_rate"])
-                if best is None or key > best[0]:
-                    best = (key, weights)
-
-    if best is None:
-        return {"structure": 25, "momentum": 30, "flow": 20, "derivatives": 15, "news": 10}
-    return {k: int(v) for k, v in best[1].items()}
+                weights = dict(structure=structure, momentum=momentum, flow=flow, derivatives=derivative, news=10)
+                metrics = evaluate_configuration_dynamic_atr(df_train, plan["tp_atr_multiplier"],
+                    plan["sl_atr_multiplier"], weights, costs, config=plan)
+                if metrics and metrics["eligible_for_selection"]:
+                    key = (metrics["portfolio_return_pct"], metrics["expectancy"])
+                    if best is None or key > best[0]:
+                        best = (key, weights)
+    return best[1] if best else dict(BASE_WEIGHTS)
 
 
-def save_calibrated_config(
-    best_params: Dict[str, Any],
-    calibrated_weights: Dict[str, int],
-    test_metrics: Dict[str, Any],
-    train_metrics: Dict[str, Any],
-    filepath: str = CALIBRATED_CONFIG_PATH
-) -> None:
-    """Menyimpan konfigurasi parameter optimal hasil kalibrasi out-of-sample ke JSON."""
-    config_payload = {
-        "calibrated_at": str(pd.Timestamp.now(tz="UTC")),
-        "validation_method": "Time-Series Train/Test Split (70% In-Sample / 30% Out-of-Sample)",
-        "train_sample_trades": train_metrics.get("total_trades", 0),
-        "test_sample_trades": test_metrics.get("total_trades", 0),
-        "minimum_oos_sample_required": 10,
-        "tp_atr_multiplier": best_params.get("tp_mult", 1.8),
-        "sl_atr_multiplier": best_params.get("sl_mult", 1.4),
-        "target_profit_1_pct": round(best_params.get("tp_mult", 1.8) * 3.0, 1),
-        "stop_loss_pct": -round(best_params.get("sl_mult", 1.4) * 3.2, 1),
-        "in_sample_performance": {
-            "win_rate": train_metrics.get("win_rate", 0.0),
-            "profit_factor": train_metrics.get("profit_factor", 0.0),
-            "expectancy": train_metrics.get("expectancy", 0.0),
-            "net_return_pct": train_metrics.get("net_return_pct", 0.0)
-        },
-        "out_of_sample_performance": {
-            "win_rate": test_metrics.get("win_rate", 0.0),
-            "profit_factor": test_metrics.get("profit_factor", 0.0),
-            "expectancy": test_metrics.get("expectancy", 0.0),
-            "net_return_pct": test_metrics.get("net_return_pct", 0.0)
-        },
-        "overfitting_pf_delta": round(abs(train_metrics.get("profit_factor", 0.0) - test_metrics.get("profit_factor", 0.0)), 2),
-        "weights": calibrated_weights,
-        "description": "Konfigurasi terkalibrasi secara empiris dengan validasi Out-of-Sample tanpa lookahead bias."
+def _ranges(frames):
+    return {name: {"start": frame.scan_time.min(), "end": frame.scan_time.max(), "samples": len(frame)}
+            for name, frame in frames.items() if not frame.empty}
+
+
+def save_calibrated_config(best_params, calibrated_weights, test_metrics, train_metrics,
+                           filepath=CALIBRATED_CONFIG_PATH, metadata=None):
+    plan = dict(best_params.get("plan", PLAN_DEFAULTS))
+    payload = {
+        "version": SCORING_VERSION, "calibrated_at": pd.Timestamp.now(tz="UTC").isoformat(),
+        **plan, "weights": calibrated_weights,
+        "in_sample_performance": train_metrics, "out_of_sample_performance": test_metrics,
+        "execution_costs": test_metrics.get("costs", DEFAULT_COSTS),
+        "time_stop_hours": 6, "max_positions": 5, "allocation_pct": 20,
+        "validation_method": "timestamp-grouped train/validation/test with forward-label purge",
+        "research_scope": "stored triggered candidate pool; excludes news",
+        **(metadata or {}),
     }
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(config_payload, f, indent=2, ensure_ascii=False)
-    print(f"[✓] Konfigurasi terkalibrasi berhasil disimpan di: {filepath}")
+    if not test_metrics.get("eligible_for_selection"):
+        raise ValueError("Unknown/out-of-sample outcomes cannot be applied.")
+    Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+    Path(filepath).write_text(json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8")
 
 
-def print_experiment_report(
-    df_train: pd.DataFrame,
-    df_test: pd.DataFrame,
-    df_grid_train: pd.DataFrame,
-    best_params: Dict[str, Any],
-    train_metrics: Dict[str, Any],
-    test_metrics: Dict[str, Any],
-    df_corr: pd.DataFrame,
-    calibrated_weights: Dict[str, int]
-) -> None:
-    """Mencetak Laporan Laboratorium Eksperimen Ilmiah KripikTo v2 di terminal."""
-    print("\n" + "=" * 135)
-    print("🔬 KRIPIKTO QUANTITATIVE EXPERIMENT LAB (FASE 6: KALIBRASI EMPIRIS & OUT-OF-SAMPLE VALIDATION)")
-    print("=" * 135)
-    print(f"Data Splitting : {len(df_train)} Sinyal Train (In-Sample 70%) | {len(df_test)} Sinyal Test (Out-of-Sample 30%)")
-    print(f"MFE / MAE Rata : Train MFE: {df_train['mfe_pct'].mean():+.2f}% | Test MFE: {df_test['mfe_pct'].mean():+.2f}%")
-    print("-" * 135)
-
-    if not df_corr.empty:
-        print("\n📈 ANALISIS SIGNIFIKANSI FITUR TERHADAP POTENSI KEUNTUNGAN (TRAIN DATA FEATURE IMPORTANCE):")
-        print(f"{'NAMA FITUR / PILAR':<30} {'KORELASI MFE':<15} {'MFE (GRUP ATAS)':<18} {'MFE (GRUP BAWAH)':<18} {'EDGE SPREAD':<12}")
-        print("-" * 98)
-        for _, r in df_corr.iterrows():
-            print(f"{r['fitur']:<30} {r['korelasi_mfe']:>+10.3f}        {r['mfe_high_group']:>+12.2f}%       {r['mfe_low_group']:>+12.2f}%       {r['edge_spread']:>+8.2f}%")
-        print("-" * 98)
-
-    print("\n⚖️ KALIBRASI BOBOT 5 PILAR MATEMATIS HASIL RISET EMPIRIS (TOTAL 100 POIN):")
-    print(f"   Structure (4H)   : {calibrated_weights['structure']} poin (Tren & EMA Alignment)")
-    print(f"   Momentum (1H)    : {calibrated_weights['momentum']} poin (ROC, Akselerasi & Kinetik)")
-    print(f"   Whale Flow       : {calibrated_weights['flow']} poin (Taker Buy & Akumulasi)")
-    print(f"   Derivatives      : {calibrated_weights['derivatives']} poin (Funding & Dynamic ΔOI)")
-    print(f"   AI News Catalyst : {calibrated_weights['news']} poin (Sentimen Global Gemini & Risk Guard)")
-
-    if not df_grid_train.empty:
-        print("\n🏆 HASIL GRID SEARCH DYNAMIC ATR PADA DATA TRAINING (TOP 5 KOMBINASI):")
-        print(f"{'RANK':<5} {'TP ATR MULT':<13} {'SL ATR MULT':<13} {'WIN RATE':<10} {'PROFIT FACTOR':<15} {'EXPECTANCY':<12} {'NET RETURN':<12}")
-        print("-" * 88)
-        for i, r in df_grid_train.head(5).iterrows():
-            tp_str = f"{r['tp_mult']:.1f}x ATR"
-            sl_str = f"{r['sl_mult']:.1f}x ATR"
-            wr_str = f"{r['win_rate']:.1f}%"
-            pf_str = f"{r['profit_factor']:.2f}"
-            exp_str = f"${r['expectancy']:+.2f}"
-            net_str = f"{r['net_return_pct']:+.1f}%"
-            print(f"#{i+1:<4} {tp_str:<13} {sl_str:<13} {wr_str:<10} {pf_str:<15} {exp_str:<12} {net_str:<12}")
-        print("-" * 88)
-
-    print("\n🛡️ UJI VALIDASI OUT-OF-SAMPLE (MENCEGAH OVERFITTING):")
-    print(f"{'METRIK PERFORMA':<25} {'IN-SAMPLE (TRAIN 70%)':<25} {'OUT-OF-SAMPLE (TEST 30%)':<25} {'STATUS VALIDITAS':<20}")
-    print("-" * 95)
-    
-    pf_tr = train_metrics.get("profit_factor", 0.0)
-    pf_ts = test_metrics.get("profit_factor", 0.0)
-    wr_tr = train_metrics.get("win_rate", 0.0)
-    wr_ts = test_metrics.get("win_rate", 0.0)
-    exp_tr = train_metrics.get("expectancy", 0.0)
-    exp_ts = test_metrics.get("expectancy", 0.0)
-
-    pf_status = "✅ SOLID EDGE" if pf_ts >= 1.5 else "⚠️ MARGINAL"
-    wr_status = "✅ STABLE" if abs(wr_tr - wr_ts) <= 15.0 else "⚠️ DIVERGENT"
-    exp_status = "✅ POSITIVE EXPECTANCY" if exp_ts > 0 else "❌ NEGATIVE"
-
-    print(f"{'Profit Factor':<25} {pf_tr:<25.2f} {pf_ts:<25.2f} {pf_status:<20}")
-    print(f"{'Win Rate %':<25} {f'{wr_tr:.1f}%':<25} {f'{wr_ts:.1f}%':<25} {wr_status:<20}")
-    print(f"{'Trade Expectancy':<25} {f'${exp_tr:+.2f}':<25} {f'${exp_ts:+.2f}':<25} {exp_status:<20}")
-    print("-" * 95)
-
-    print(f"Overfitting Gap (Delta PF) : {abs(pf_tr - pf_ts):.2f} poin (Nilai di bawah 1.5 menandakan model tahan banting terhadap data baru).")
-    print("=" * 135 + "\n")
-
-
-def run_calibration_lab(
-    apply_best: bool = False,
-    db_path: str = DB_PATH
-) -> None:
-    """Menjalankan alur penuh eksperimen kalibrasi empiris."""
-    df_dataset = load_dataset(db_path=db_path, only_filled=True)
-    if df_dataset.empty:
-        print("[!] Dataset sinyal yang terisi (filled) belum mencukupi untuk kalibrasi.")
-        return
-
-    # 1. Time-series Train/Test Split
-    df_train, df_test = split_train_test(df_dataset, train_ratio=0.70)
-    if df_train.empty or df_test.empty:
-        print(f"[!] Dataset belum cukup untuk OOS validation. Minimal 30 filled signals; saat ini {len(df_dataset)}.")
-        return
-
-    # 2. Grid Search Dynamic ATR pada data Train
-    df_grid_train = run_dynamic_atr_grid_search(df_train)
-    if df_grid_train.empty:
-        print("[!] Gagal menjalankan grid search.")
-        return
-
-    best_params = df_grid_train.iloc[0].to_dict()
-    train_metrics = best_params
-
-    # 3. Evaluasi parameter beku (frozen) pada data Out-of-Sample Test
-    test_metrics = evaluate_configuration_dynamic_atr(
-        df_test,
-        tp_mult=best_params["tp_mult"],
-        sl_mult=best_params["sl_mult"]
-    )
-
-    # 4. Analisis korelasi fitur & optimasi bobot pada data Train
-    df_corr = analyze_feature_correlations(df_train)
-    calibrated_weights = optimize_pillar_weights(df_train, df_corr)
-
-    # 5. Cetak laporan ilmiah
-    print_experiment_report(
-        df_train=df_train,
-        df_test=df_test,
-        df_grid_train=df_grid_train,
-        best_params=best_params,
-        train_metrics=train_metrics,
-        test_metrics=test_metrics,
-        df_corr=df_corr,
-        calibrated_weights=calibrated_weights
-    )
-
-    # 6. Simpan konfigurasi jika diminta
+def run_calibration_lab(apply_best=False, db_path=DB_PATH, costs=None):
+    dataset = load_dataset(db_path)
+    if dataset.empty:
+        print("[!] No complete canonical forward windows. Run outcome_tracker --recheck first.")
+        return None
+    train, validation, test = split_train_validation_test(dataset)
+    if train.empty:
+        print("[!] Need timestamp groups with at least 20 train / 10 validation / 10 test records after purging overlapping labels.")
+        return None
+    grid = run_dynamic_atr_grid_search(train, costs=costs)
+    if grid.empty:
+        print("[!] No fully resolved replay configuration; no parameters applied.")
+        return None
+    best = grid.iloc[0].to_dict()
+    weights = optimize_pillar_weights(train, plan=best["plan"], costs=costs)
+    # Validation chooses between baseline and the train proposal. Test stays untouched.
+    baseline = evaluate_configuration_dynamic_atr(validation, 1.6, 1.25, BASE_WEIGHTS, costs)
+    proposal = evaluate_configuration_dynamic_atr(validation, best["tp_mult"], best["sl_mult"], weights, costs, config=best["plan"])
+    use_proposal = bool(proposal and proposal["eligible_for_selection"] and
+                        (not baseline or not baseline["eligible_for_selection"] or
+                         proposal["portfolio_return_pct"] > baseline["portfolio_return_pct"]))
+    if not use_proposal:
+        weights = dict(BASE_WEIGHTS)
+        best = {"tp_mult": 1.6, "sl_mult": 1.25, "plan": dict(PLAN_DEFAULTS)}
+    train_metrics = evaluate_configuration_dynamic_atr(train, best["tp_mult"], best["sl_mult"], weights, costs, config=best["plan"])
+    test_metrics = evaluate_configuration_dynamic_atr(test, best["tp_mult"], best["sl_mult"], weights, costs, config=best["plan"])
+    ab = {mode: evaluate_configuration_dynamic_atr(test, 1.6, 1.25, BASE_WEIGHTS, costs, score_mode=mode)
+          for mode in ("v1", "v2")}
+    # Diagnostic walk-forward folds use defaults and only earlier training outcomes.
+    walks = []
+    for fold_train, fold_test in walk_forward_splits(dataset):
+        fold_grid = run_dynamic_atr_grid_search(fold_train, costs=costs)
+        if fold_grid.empty:
+            continue
+        choice = fold_grid.iloc[0].to_dict()
+        fold_weights = optimize_pillar_weights(fold_train, plan=choice["plan"], costs=costs)
+        walks.append({"ranges": _ranges({"train": fold_train, "test": fold_test}),
+            "metrics": evaluate_configuration_dynamic_atr(fold_test, choice["tp_mult"], choice["sl_mult"], fold_weights, costs, config=choice["plan"])})
+    report = {"dataset_range": _ranges({"train": train, "validation": validation, "test": test}),
+              "weights": weights, "plan": best["plan"], "train": train_metrics,
+              "validation": proposal if use_proposal else baseline, "test": test_metrics,
+              "ab_same_candidate_pool": ab, "walk_forward": walks,
+              "atr_trials": 42, "weight_trials": 27,
+              "uncertainty": "No significance/edge claim; correlated trades and search selection require further statistical analysis."}
+    print(json.dumps(report, indent=2, allow_nan=False))
     if apply_best:
-        save_calibrated_config(
-            best_params=best_params,
-            calibrated_weights=calibrated_weights,
-            test_metrics=test_metrics,
-            train_metrics=train_metrics,
-            filepath=CALIBRATED_CONFIG_PATH
-        )
+        save_calibrated_config(best, weights, test_metrics, train_metrics,
+            metadata={"dataset_range": report["dataset_range"], "validation_performance": report["validation"],
+                      "walk_forward": walks, "ab_same_candidate_pool": ab,
+                      "trial_counts": {"atr": 42, "weights_upper_bound": 27}})
+    return report
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="KripikTo Quantitative Experiment Lab (Fase 6)")
-    parser.add_argument("--apply", action="store_true", help="Simpan parameter optimal & bobot terkalibrasi ke calibrated_config.json")
-    parser.add_argument("--db", type=str, default=DB_PATH, help="Path ke database SQLite")
+    parser = argparse.ArgumentParser(description="KripikTo chronological replay calibration")
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--db", default=DB_PATH)
+    parser.add_argument("--fee-pct", type=float, default=DEFAULT_COSTS["fee_pct"])
+    parser.add_argument("--slippage-pct", type=float, default=DEFAULT_COSTS["slippage_pct"])
+    parser.add_argument("--spread-pct", type=float, default=DEFAULT_COSTS["spread_pct"])
     args = parser.parse_args()
-
-    run_calibration_lab(apply_best=args.apply, db_path=args.db)
+    run_calibration_lab(args.apply, args.db,
+        costs={"fee_pct": args.fee_pct, "slippage_pct": args.slippage_pct, "spread_pct": args.spread_pct})

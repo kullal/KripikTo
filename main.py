@@ -73,7 +73,8 @@ def run_all(
     # TAHAP 3: GLOBAL NEWS SCRAPING + GEMINI LLM SENTIMENT & RISK GUARD
     # -------------------------------------------------------------
     print(f"\n[LANGKAH 3/3] Mengambil berita global & menganalisis sentimen katalis dengan Google Gemini...")
-    final_picks = run_news_sentiment_pipeline(top_limit=top_picks_limit, fgi=fgi)
+    final_picks = run_news_sentiment_pipeline(top_limit=top_picks_limit, fgi=fgi,
+        candidates=scan_picks.astype(object).where(scan_picks.notna(), None).to_dict("records"))
 
     if final_picks:
         print_final_executive_report(final_picks)

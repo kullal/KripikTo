@@ -8,6 +8,10 @@ Modul Analisis Sentimen Berita Kripto dengan Google Gemini LLM (Tahap 3):
 5. Menyimpan rekomendasi final lengkap dengan Trading Plan ke database SQLite dan file JSON.
 """
 
+import hashlib
+import math
+import re
+from email.utils import parsedate_to_datetime
 import os
 import sys
 import json
@@ -20,6 +24,50 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 import pandas as pd
 import requests
+
+try:
+    from backend.feature_engine import BASE_WEIGHTS, SCORING_VERSION, compose_quant_score, load_calibrated_config
+    from backend.research_utils import database, signal_id, utc_time
+except ImportError:
+    from feature_engine import BASE_WEIGHTS, SCORING_VERSION, compose_quant_score, load_calibrated_config
+    from research_utils import database, signal_id, utc_time
+
+ASSET_NAMES = {"BTC": "Bitcoin", "ETH": "Ethereum", "SOL": "Solana",
+               "BNB": "BNB", "XRP": "XRP", "ADA": "Cardano", "DOGE": "Dogecoin",
+               "AVAX": "Avalanche", "LINK": "Chainlink", "DOT": "Polkadot"}
+
+
+class NewsItems(list):
+    def __init__(self, items=(), status="AVAILABLE"):
+        super().__init__(items)
+        self.status = status
+
+
+def unavailable_sentiment(status, message):
+    return {"sentiment": "UNKNOWN", "sentiment_score": None,
+            "catalyst": message, "impact_level": "UNKNOWN", "crypto_risk": None,
+            "news_status": status, "model": None, "prompt_hash": None}
+
+
+def validate_sentiment_response(parsed):
+    if not isinstance(parsed, dict):
+        raise ValueError("Expected a JSON object.")
+    sentiment = parsed.get("sentiment")
+    impact = parsed.get("impact_level")
+    score = parsed.get("sentiment_score")
+    risk = parsed.get("crypto_risk")
+    catalyst = parsed.get("catalyst")
+    if (sentiment not in {"BULLISH", "NEUTRAL", "BEARISH"}
+            or impact not in {"TINGGI", "SEDANG", "RENDAH"}
+            or type(risk) is not bool or type(score) not in (float, int)
+            or not math.isfinite(score) or not -1 <= score <= 1
+            or not isinstance(catalyst, str) or not catalyst.strip()):
+        raise ValueError("Invalid sentiment schema.")
+    if risk and (sentiment != "BEARISH" or not -1 <= score <= -0.8 or impact != "TINGGI"):
+        raise ValueError("Risk Guard response is inconsistent.")
+    return dict(sentiment=sentiment, sentiment_score=float(score), crypto_risk=risk,
+                impact_level=impact, catalyst=catalyst)
+
 
 # Pastikan output utf-8 aman di terminal Windows
 if sys.platform == "win32" and sys.stdout.encoding.lower() != "utf-8":
@@ -54,7 +102,7 @@ def load_gemini_api_key() -> str:
 
 def init_news_db(db_path: str = DB_PATH) -> None:
     """Inisialisasi tabel analisis sentimen berita dan rekomendasi final di SQLite."""
-    with sqlite3.connect(db_path) as conn:
+    with database(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS kripto_sentiment_analysis (
@@ -90,7 +138,10 @@ def init_news_db(db_path: str = DB_PATH) -> None:
             ("open_interest_m", "REAL"),
             ("v2_score", "INTEGER"),
             ("setup_type", "TEXT"),
-            ("entry_status", "TEXT")
+            ("entry_status", "TEXT"),
+            ("signal_id", "TEXT"), ("news_analyzed_at", "TEXT"), ("news_status", "TEXT"),
+            ("evidence_json", "TEXT"), ("model", "TEXT"), ("prompt_hash", "TEXT"),
+            ("execution_eligible", "INTEGER"), ("scoring_version", "TEXT")
         ]:
             if col not in cols:
                 try:
@@ -107,17 +158,22 @@ def fetch_news_for_crypto(symbol: str, max_items: int = 4) -> List[Dict[str, str
     Mencakup agregasi portal media kripto terkemuka (CoinDesk, Cointelegraph, Decrypt, dll).
     Menggabungkan pencarian berita umum dan pencarian khusus risiko keamanan (Hack, Exploit, Delist, SEC).
     """
-    base_coin = symbol.replace("USDT", "").strip()
+    base_coin = symbol.removesuffix("USDT").strip()
+    asset_name = ASSET_NAMES.get(base_coin, base_coin)
+    fetch_failed = False
+    now = datetime.datetime.now(datetime.timezone.utc)
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
     def _query_rss(query_str: str, limit: int = 3) -> List[Dict[str, str]]:
+        nonlocal fetch_failed
         encoded = urllib.parse.quote(query_str)
         rss_url = f"https://news.google.com/rss/search?q={encoded}&hl=en-US&gl=US&ceid=US:en"
         try:
             resp = requests.get(rss_url, headers=headers, timeout=10)
             if resp.status_code != 200:
+                fetch_failed = True
                 return []
             root = ET.fromstring(resp.content)
             items = []
@@ -127,6 +183,15 @@ def fetch_news_for_crypto(symbol: str, max_items: int = 4) -> List[Dict[str, str
                 source = it.find("source").text if it.find("source") is not None else "Media"
                 link = it.find("link").text if it.find("link") is not None else ""
                 if title:
+                    try:
+                        published = parsedate_to_datetime(pub_date).astimezone(datetime.timezone.utc)
+                    except (TypeError, ValueError):
+                        continue
+                    if not 0 <= (now - published).total_seconds() <= 72 * 3600:
+                        continue
+                    if not (re.search(r"(?<![A-Za-z0-9])" + re.escape(base_coin) + r"(?![A-Za-z0-9])", title, re.I)
+                            or asset_name.lower() in title.lower()):
+                        continue
                     items.append({
                         "title": title,
                         "source": source,
@@ -134,15 +199,16 @@ def fetch_news_for_crypto(symbol: str, max_items: int = 4) -> List[Dict[str, str
                         "link": link
                     })
             return items
-        except Exception:
+        except (requests.RequestException, ET.ParseError):
+            fetch_failed = True
             return []
 
     # 1. Kueri Risiko Keamanan & Regulasi (Crypto Risk Guard)
-    risk_query = f'"{base_coin}" crypto (hack OR exploit OR "sec" OR lawsuit OR delist OR scam OR stolen OR insolvency)'
+    risk_query = f'"{asset_name}" crypto (hack OR exploit OR "sec" OR lawsuit OR delist OR scam OR stolen OR insolvency)'
     risk_items = _query_rss(risk_query, limit=2)
 
     # 2. Kueri Berita Umum Proyek & Pergerakan Pasar
-    gen_query = f'"{base_coin}" crypto (price OR partnership OR upgrade OR launch OR bull OR whale OR ETF)'
+    gen_query = f'"{asset_name}" crypto (price OR partnership OR upgrade OR launch OR bull OR whale OR ETF)'
     gen_items = _query_rss(gen_query, limit=max_items)
 
     # Gabungkan dengan prioritas berita risiko di awal & cegah duplikasi
@@ -156,7 +222,7 @@ def fetch_news_for_crypto(symbol: str, max_items: int = 4) -> List[Dict[str, str
             if len(combined_items) >= max_items:
                 break
 
-    return combined_items
+    return NewsItems(combined_items, "FETCH_FAILED" if fetch_failed else ("AVAILABLE" if combined_items else "NO_NEWS"))
 
 
 def analyze_sentiment_with_gemini(
@@ -171,14 +237,10 @@ def analyze_sentiment_with_gemini(
     """
     base_coin = symbol.replace("USDT", "")
 
+    if getattr(news_items, "status", None) == "FETCH_FAILED":
+        return unavailable_sentiment("FETCH_FAILED", "Pengambilan berita tidak lengkap; Risk Guard belum terverifikasi.")
     if not news_items:
-        return {
-            "sentiment": "NEUTRAL",
-            "sentiment_score": 0.0,
-            "catalyst": "Tidak ada berita spesifik terbaru yang signifikan; murni didorong momentum teknikal.",
-            "impact_level": "RENDAH",
-            "crypto_risk": False
-        }
+        return unavailable_sentiment("NO_NEWS", "Tidak ada headline relevan dalam 72 jam; Risk Guard belum terverifikasi.")
 
     headlines = "\n".join([f"- [{item['source']}] {item['title']}" for item in news_items])
     macro_info = f"Sentimen Makro Pasar Kripto Global: {fgi_context}\n" if fgi_context else ""
@@ -231,7 +293,8 @@ Kembalikan jawaban HANYA berupa JSON valid dengan skema berikut:
     }
 
     # Model prioritas Gemini Flash untuk fallback otomatis jika satu model sibuk
-    models_to_try = ["gemini-flash-latest", "gemini-3.5-flash-lite", "gemini-3.8-flash"]
+    models_to_try = [os.environ.get("GEMINI_MODEL", "gemini-flash-latest")]
+    prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
     for model_name in models_to_try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
@@ -251,14 +314,8 @@ Kembalikan jawaban HANYA berupa JSON valid dengan skema berikut:
                         lines = lines[:-1]
                     text_resp = "\n".join(lines).strip()
 
-                parsed = json.loads(text_resp)
-                return {
-                    "sentiment": str(parsed.get("sentiment", "NEUTRAL")).upper(),
-                    "sentiment_score": float(parsed.get("sentiment_score", 0.0)),
-                    "catalyst": str(parsed.get("catalyst", "-")),
-                    "impact_level": str(parsed.get("impact_level", "SEDANG")).upper(),
-                    "crypto_risk": bool(parsed.get("crypto_risk", False))
-                }
+                parsed = validate_sentiment_response(json.loads(text_resp))
+                return dict(parsed, news_status="AVAILABLE", model=model_name, prompt_hash=prompt_hash)
             elif resp.status_code in (429, 503):
                 time.sleep(1.5)
                 continue
@@ -268,13 +325,9 @@ Kembalikan jawaban HANYA berupa JSON valid dengan skema berikut:
             time.sleep(1)
             continue
 
-    return {
-        "sentiment": "NEUTRAL",
-        "sentiment_score": 0.0,
-        "catalyst": "Koneksi model sentimen tidak tersedia; menggunakan skor teknikal & paus.",
-        "impact_level": "RENDAH",
-        "crypto_risk": False
-    }
+    result = unavailable_sentiment("MODEL_FAILED", "Model sentimen tidak tersedia atau respons tidak valid; Risk Guard belum terverifikasi.")
+    result["prompt_hash"] = prompt_hash
+    return result
 
 
 def calculate_news_pillar_score(sentiment_score: float) -> int:
@@ -289,6 +342,10 @@ def calculate_news_pillar_score(sentiment_score: float) -> int:
       * -0.5 s.d -0.2 (Bearish)  -> 2 poin
       * < -0.5 (Strong Bearish)  -> 0 poin
     """
+    if sentiment_score is None:
+        return 0
+    if not math.isfinite(sentiment_score) or not -1 <= sentiment_score <= 1:
+        raise ValueError("Sentiment score must be finite in [-1, 1].")
     if sentiment_score >= 0.6:
         return 10
     elif sentiment_score >= 0.2:
@@ -304,14 +361,17 @@ def calculate_news_pillar_score(sentiment_score: float) -> int:
 def calculate_unified_v2_final_score(
     v2_score: int,
     sentiment_score: float,
-    crypto_risk: bool = False
-) -> int:
+    crypto_risk: bool = False,
+    news_weight: float = 10,
+) -> float:
     """
     Menyatukan skor kuantitatif v2 (maksimal 90 dari Pilar 1-4 + Makro baseline)
     dengan Pilar ke-5 AI News (0 - 10 poin) ke dalam basis 100 poin tunggal yang konsisten.
     Crypto Risk Guard: Hard safety override membatasi maksimal 35 jika ada risiko fatal.
     """
-    news_pts = calculate_news_pillar_score(sentiment_score)
+    if not math.isfinite(news_weight) or not 0 < news_weight < 100:
+        raise ValueError("Invalid news weight.")
+    news_pts = calculate_news_pillar_score(sentiment_score) / 10 * news_weight
     final_score = min(100, v2_score + news_pts)
     if crypto_risk:
         final_score = min(final_score, 35)
@@ -376,13 +436,16 @@ def get_recommendation_label(
 def run_news_sentiment_pipeline(
     top_limit: int = 15,
     fgi: Optional[Dict[str, Any]] = None,
-    db_path: str = DB_PATH
+    db_path: str = DB_PATH,
+    candidates: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Menjalankan alur lengkap analisis sentimen berita LLM untuk koin hasil scan teratas.
     """
     api_key = load_gemini_api_key()
     if not api_key:
+        Path(FINAL_JSON_PATH).parent.mkdir(parents=True, exist_ok=True)
+        Path(FINAL_JSON_PATH).write_text("[]", encoding="utf-8")
         print("[!] GEMINI_API_KEY tidak ditemukan di environment atau .env.")
         print("[*] Masukkan GEMINI_API_KEY di file .env untuk mengaktifkan analisis berita AI.")
         return []
@@ -394,16 +457,20 @@ def run_news_sentiment_pipeline(
         fgi_context = f"{fgi.get('classification', 'Neutral')} ({fgi.get('value', 50)}/100) - {fgi.get('advice', '')}"
 
     # Baca kandidat koin dari file scan_latest.json atau SQLite
-    scan_candidates = []
-    if Path(SCAN_JSON_PATH).exists():
+    scan_candidates = [] if candidates is None else candidates
+    if candidates is not None:
+        pass
+    elif Path(SCAN_JSON_PATH).exists() and db_path == DB_PATH:
         with open(SCAN_JSON_PATH, "r", encoding="utf-8") as f:
             scan_candidates = json.load(f)
     else:
-        with sqlite3.connect(db_path) as conn:
-            df = pd.read_sql("SELECT * FROM scan_results ORDER BY score DESC, taker_buy_ratio DESC LIMIT ?", conn, params=(top_limit,))
+        with database(db_path) as conn:
+            df = pd.read_sql("SELECT * FROM scan_results WHERE scan_time=(SELECT MAX(scan_time) FROM scan_results) ORDER BY CASE entry_status WHEN 'TRIGGERED' THEN 4 WHEN 'READY' THEN 3 WHEN 'WAIT' THEN 2 WHEN 'EXTENDED' THEN 1 ELSE 0 END DESC, score DESC, taker_buy_ratio DESC LIMIT ?", conn, params=(top_limit,))
             scan_candidates = df.to_dict(orient="records")
 
     if not scan_candidates:
+        Path(FINAL_JSON_PATH).parent.mkdir(parents=True, exist_ok=True)
+        Path(FINAL_JSON_PATH).write_text("[]", encoding="utf-8")
         print("[!] Tidak ada kandidat koin dari pemindaian Tahap 2.")
         return []
 
@@ -411,9 +478,9 @@ def run_news_sentiment_pipeline(
     print(f"[*] Menganalisis berita global & sentimen Gemini Flash untuk {len(picks_to_analyze)} koin terpilih...")
 
     final_results = []
-    now_utc_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
     for i, item in enumerate(picks_to_analyze):
+        if item.get("scoring_version") != SCORING_VERSION:
+            continue
         sym = item["symbol"]
         tech_score = int(item["score"])
         fr = float(item.get("funding_rate", 0.0))
@@ -423,7 +490,7 @@ def run_news_sentiment_pipeline(
         # Tambahkan konteks Short Squeeze ke prompt jika Funding Rate negatif
         coin_fgi_context = fgi_context
         if fr <= -0.015:
-            squeeze_note = f"\nKondisi Derivatif Koin: Funding Rate {fr:+.4f}% (Potensi SHORT SQUEEZE: Posisi short ritel over-leveraged, rawan terlikuidasi jika harga spot naik)."
+            squeeze_note = f"\nKondisi Derivatif Koin: Funding Rate {fr:+.4f}% (Bias pendanaan negatif; funding saja tidak membuktikan short squeeze)."
             coin_fgi_context = (fgi_context + squeeze_note) if fgi_context else squeeze_note.strip()
 
         news_items = fetch_news_for_crypto(symbol=sym, max_items=4)
@@ -440,18 +507,37 @@ def run_news_sentiment_pipeline(
         catalyst = sentiment_res["catalyst"]
         crypto_risk = sentiment_res["crypto_risk"]
 
-        v2_score = int(item.get("v2_score", tech_score))
+        weights = json.loads(item.get("weights_json") or json.dumps(BASE_WEIGHTS))
+        if item.get("scoring_version") != SCORING_VERSION:
+            continue  # Legacy scores cannot safely be mixed with normalized scores.
+        v2_score = compose_quant_score({"structure": item["structure_score"],
+            "momentum": item["momentum_score"], "flow": item["flow_score"],
+            "derivatives": item["derivative_score"]}, weights, item.get("score_penalty", 0))
         setup_type = str(item.get("setup_type", "NO_SETUP"))
         entry_status = str(item.get("entry_status", "WAIT"))
 
-        final_score = calculate_unified_v2_final_score(v2_score, sent_score, crypto_risk)
+        final_score = calculate_unified_v2_final_score(v2_score, sent_score, crypto_risk, weights["news"])
         recom = get_recommendation_label(
             final_score, sentiment, v2_score, crypto_risk,
             entry_status=entry_status, setup_type=setup_type
         )
 
+        news_status = sentiment_res.get("news_status", "MODEL_FAILED")
+        analyzed_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        signal_age = (utc_time(analyzed_at) - utc_time(item["scan_time"])).total_seconds()
+        if news_status != "AVAILABLE":
+            recom = "NEWS_UNVERIFIED (Risk Guard belum tersedia)"
+        elif not crypto_risk and not 0 <= signal_age <= 900:
+            recom = "SIGNAL_EXPIRED (Perlu scan baru)"
         record = {
-            "scan_time": now_utc_str,
+            "scan_time": item["scan_time"],
+            "signal_id": signal_id(item["scan_time"], sym),
+            "news_analyzed_at": analyzed_at, "news_status": news_status,
+            "model": sentiment_res.get("model"), "prompt_hash": sentiment_res.get("prompt_hash"),
+            "evidence_json": json.dumps(news_items, ensure_ascii=False),
+            "scoring_version": SCORING_VERSION,
+            "execution_eligible": int("BUY" in recom and item.get("data_quality_status") == "OK"),
+            "entry_price": item.get("entry_price"),
             "symbol": sym,
             "tech_score": tech_score,
             "v2_score": v2_score,
@@ -464,7 +550,7 @@ def run_news_sentiment_pipeline(
             "impact_level": impact,
             "catalyst": catalyst,
             "news_count": len(news_items),
-            "crypto_risk": 1 if crypto_risk else 0,
+            "crypto_risk": None if crypto_risk is None else int(crypto_risk),
             "final_score": final_score,
             "recommendation": recom,
             "buy_area": item.get("buy_area", "-"),
@@ -483,7 +569,7 @@ def run_news_sentiment_pipeline(
     final_results.sort(key=lambda x: x["final_score"], reverse=True)
 
     # Simpan ke SQLite
-    with sqlite3.connect(db_path) as conn:
+    with database(db_path) as conn:
         cursor = conn.cursor()
         insert_query = """
             INSERT OR REPLACE INTO kripto_sentiment_analysis (
@@ -505,9 +591,15 @@ def run_news_sentiment_pipeline(
             for r in final_results
         ]
         cursor.executemany(insert_query, records)
+        cursor.executemany("""UPDATE kripto_sentiment_analysis SET signal_id=?, news_analyzed_at=?,
+            news_status=?, evidence_json=?, model=?, prompt_hash=?, execution_eligible=?, scoring_version=?
+            WHERE scan_time=? AND symbol=?""",
+            [(r["signal_id"], r["news_analyzed_at"], r["news_status"], r["evidence_json"], r["model"],
+              r["prompt_hash"], r["execution_eligible"], r["scoring_version"], r["scan_time"], r["symbol"]) for r in final_results])
         conn.commit()
 
     # Simpan ke JSON final
+    Path(FINAL_JSON_PATH).parent.mkdir(parents=True, exist_ok=True)
     with open(FINAL_JSON_PATH, "w", encoding="utf-8") as f:
         json.dump(final_results, f, indent=2, ensure_ascii=False)
 

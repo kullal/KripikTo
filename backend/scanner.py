@@ -35,10 +35,10 @@ if sys.platform == "win32" and sys.stdout.encoding.lower() != "utf-8":
 # Import path database & macro sentiment & derivatives
 try:
     from backend.macro_sentiment import fetch_fear_and_greed_index
-    from backend.derivatives_flow import fetch_derivatives_summary, get_derivatives_deltas
+    from backend.derivatives_flow import fetch_derivatives_summary, get_derivatives_deltas, validate_derivative_snapshot
 except ImportError:
     from macro_sentiment import fetch_fear_and_greed_index
-    from derivatives_flow import fetch_derivatives_summary, get_derivatives_deltas
+    from derivatives_flow import fetch_derivatives_summary, get_derivatives_deltas, validate_derivative_snapshot
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -59,7 +59,7 @@ try:
         classify_setup_and_status,
         calculate_dynamic_tp_sl,
         evaluate_15m_trigger,
-        DEFAULT_WEIGHTS
+        DEFAULT_WEIGHTS, BASE_WEIGHTS, SCORING_VERSION, compose_quant_score
     )
     from backend.data_integrity import (
         aligned_relative_strength, validate_closed_candles, validate_market_summary,
@@ -76,7 +76,7 @@ except ImportError:
         classify_setup_and_status,
         calculate_dynamic_tp_sl,
         evaluate_15m_trigger,
-        DEFAULT_WEIGHTS
+        DEFAULT_WEIGHTS, BASE_WEIGHTS, SCORING_VERSION, compose_quant_score
     )
     from data_integrity import (
         aligned_relative_strength, validate_closed_candles, validate_market_summary,
@@ -193,7 +193,10 @@ def init_scanner_db(db_path: str = DB_PATH) -> None:
             ("btc_return_structure", "REAL"), ("rs_structure_status", "TEXT"),
             ("rs_1h_status", "TEXT"), ("data_quality_status", "TEXT"),
             ("data_quality_notes", "TEXT"), ("candle_open_time", "INTEGER"),
-            ("candle_close_time_ms", "INTEGER")
+            ("candle_close_time_ms", "INTEGER"),
+            ("support_level", "REAL"), ("score_penalty", "REAL"),
+            ("scoring_version", "TEXT"), ("weights_json", "TEXT"), ("signal_id", "TEXT"),
+            ("derivatives_status", "TEXT")
         ]
         for col, ctype in new_cols:
             if col not in cols:
@@ -201,6 +204,13 @@ def init_scanner_db(db_path: str = DB_PATH) -> None:
                     cursor.execute(f"ALTER TABLE scan_results ADD COLUMN {col} {ctype}")
                 except Exception:
                     pass
+
+        cols = {c[1] for c in cursor.execute("PRAGMA table_info(scan_results)").fetchall()}
+        for col, ctype in [("support_level", "REAL"), ("score_penalty", "REAL"),
+                ("scoring_version", "TEXT"), ("weights_json", "TEXT"), ("signal_id", "TEXT"),
+                ("derivatives_status", "TEXT")]:
+            if col not in cols:
+                cursor.execute(f"ALTER TABLE scan_results ADD COLUMN {col} {ctype}")
 
         # Migrasi kolom signal_outcomes
         cursor.execute("PRAGMA table_info(signal_outcomes)")
@@ -282,6 +292,13 @@ def run_scanner(
     Mengembalikan DataFrame berisi Top N koin teratas berdasarkan skor sinyal.
     """
     init_scanner_db(db_path)
+    try:
+        from backend.outcome_tracker import init_outcome_tracker_db
+        from backend.research_utils import signal_id
+    except ImportError:
+        from outcome_tracker import init_outcome_tracker_db
+        from research_utils import signal_id
+    init_outcome_tracker_db(db_path)
 
     if fgi is None:
         fgi = fetch_fear_and_greed_index(db_path)
@@ -404,12 +421,15 @@ def run_scanner(
 
         # Data derivatif & time-series deltas (Fase 4)
         deriv = deriv_map.get(sym, {})
-        deltas = get_derivatives_deltas(sym, db_path)
+        derivatives_status = validate_derivative_snapshot(deriv, validation_time)
+        if derivatives_status != "OK":
+            deriv = {}
+        deltas = get_derivatives_deltas(sym, db_path, now_ms=validation_time)
         funding_rate = float(deriv.get("funding_rate", 0.0))
         oi_m = float(deriv.get("open_interest_m", 0.0))
-        delta_oi_1h = float(deltas.get("delta_oi_1h", 0.0))
-        delta_oi_4h = float(deltas.get("delta_oi_4h", 0.0))
-        delta_funding_1h = float(deltas.get("delta_funding_1h", 0.0))
+        delta_oi_1h = float(deltas.get("delta_oi_1h") or 0.0)
+        delta_oi_4h = float(deltas.get("delta_oi_4h") or 0.0)
+        delta_funding_1h = float(deltas.get("delta_funding_1h") or 0.0)
 
         # Match the actual structure interval and both candles of the return.
         coin_return_structure = float(row["ret_candle"])
@@ -544,7 +564,7 @@ def run_scanner(
             structure_score -= 5
             signals.append(f"UNDERPERFORM_BTC_{interval.upper()} (RS:{rs_4h:+.1f}%)")
 
-        structure_score = max(0, min(DEFAULT_WEIGHTS["structure"], structure_score))
+        structure_score = max(0, min(BASE_WEIGHTS["structure"], structure_score))
 
         # --- PILAR 2: KINETIK MOMENTUM 1H (Maksimal 30 Poin) ---
         momentum_score = 0
@@ -597,7 +617,7 @@ def run_scanner(
             momentum_score += 3
             signals.append("RSI_OVERSOLD_REBOUND")
 
-        momentum_score = max(0, min(DEFAULT_WEIGHTS["momentum"], momentum_score))
+        momentum_score = max(0, min(BASE_WEIGHTS["momentum"], momentum_score))
         if sym not in feat_1h_map:
             momentum_score = 0
 
@@ -617,16 +637,16 @@ def run_scanner(
             flow_score += 5
             signals.append("WHALE_DIVERGENCE (Nyicil Diam-diam)")
 
-        flow_score = max(0, min(DEFAULT_WEIGHTS["flow"], flow_score))
+        flow_score = max(0, min(BASE_WEIGHTS["flow"], flow_score))
 
         # --- PILAR 4: DERIVATIF & DINAMIKA OI (Maksimal 15 Poin) ---
         derivative_score = 0
-        if funding_rate <= -0.05 or (funding_rate <= -0.015 and delta_oi_1h > 0):
+        if derivatives_status == "OK" and funding_rate <= -0.015 and delta_oi_1h > 0:
             derivative_score += 12
             signals.append(f"EXTREME_SHORT_SQUEEZE (FR:{funding_rate:+.3f}%, ΔOI:+${delta_oi_1h}M)")
         elif funding_rate <= -0.015:
             derivative_score += 8
-            signals.append(f"POTENSI_SHORT_SQUEEZE (FR:{funding_rate:+.3f}%)")
+            signals.append(f"NEGATIVE_FUNDING_BIAS (FR:{funding_rate:+.3f}%)")
         elif delta_funding_1h < -0.003 and delta_oi_1h > 0:
             derivative_score += 6
             signals.append(f"SHORT_BUILDUP (ΔFR:{delta_funding_1h:+.3f}%, ΔOI:+${delta_oi_1h}M)")
@@ -641,7 +661,7 @@ def run_scanner(
             derivative_score += 3
             signals.append(f"BIG_OI_SHORT_POOL (${oi_m}M)")
 
-        derivative_score = max(0, min(DEFAULT_WEIGHTS["derivatives"], derivative_score))
+        derivative_score = max(0, min(BASE_WEIGHTS["derivatives"], derivative_score)) if derivatives_status == "OK" else 0
 
         # --- PILAR 5: MAKRO BAROMETER (Maksimal 10 Poin) ---
         macro_score = 5 # Baseline
@@ -662,17 +682,19 @@ def run_scanner(
             macro_score -= 2
             signals.append("⚠️ WASPADA_TAIL_RISK")
 
-        macro_score = max(0, min(DEFAULT_WEIGHTS["news"], macro_score))
+        macro_score = max(0, min(10, macro_score))  # Context only; not a sixth score pillar.
 
         # --- SKOR TOTAL V2 KOMPOSIT ---
-        v2_score = structure_score + momentum_score + flow_score + derivative_score + macro_score
+        score_penalty = (15 if change_24h > 35.0 else 0) + (10 if rsi >= 80.0 else 0)
+        v2_score = compose_quant_score({"structure": structure_score, "momentum": momentum_score,
+            "flow": flow_score, "derivatives": derivative_score}, DEFAULT_WEIGHTS, score_penalty)
 
         # Penalti risiko pompaan ekstrem
         if change_24h > 35.0:
-            v2_score -= 15
+            # Penalty applied in shared scoring above.
             signals.append("RISIKO_PUCUK (Naik >35%)")
         if rsi >= 80.0:
-            v2_score -= 10
+            # Penalty applied in shared scoring above.
             signals.append("RSI_OVERBOUGHT_EXTREME")
 
         v2_score = max(0, min(100, v2_score))
@@ -755,12 +777,13 @@ def run_scanner(
             "quote_vol_m": round(quote_vol_m, 2),
             "taker_buy_ratio": round(taker_ratio, 2),
             "funding_rate": funding_rate,
+            "derivatives_status": derivatives_status,
             "open_interest_m": oi_m,
             "rsi14": round(rsi, 1),
             "vol_ratio": round(vol_ratio, 2),
-            "score": int(v2_score),
+            "score": v2_score,
             "v1_score": int(v1_score),
-            "v2_score": int(v2_score),
+            "v2_score": v2_score,
             "setup_type": setup_type,
             "entry_status": entry_status,
             "structure_score": int(structure_score),
@@ -768,6 +791,9 @@ def run_scanner(
             "flow_score": int(flow_score),
             "derivative_score": int(derivative_score),
             "macro_score": int(macro_score),
+            "support_level": support_level, "score_penalty": score_penalty,
+            "scoring_version": SCORING_VERSION,
+            "weights_json": json.dumps(DEFAULT_WEIGHTS, sort_keys=True),
             "delta_oi_1h": delta_oi_1h,
             "delta_oi_4h": delta_oi_4h,
             "delta_funding_1h": delta_funding_1h,
@@ -887,6 +913,7 @@ def run_scanner(
                             df_top_picks.at[idx, "buy_high"] = ref_high
                             df_top_picks.at[idx, "buy_area"] = f"${ref_low} - ${ref_high}"
                             df_top_picks.at[idx, "entry_price"] = ref_entry
+                            df_top_picks.at[idx, "support_level"] = t_info["micro_support"]
 
                             # Hitung ulang TP/SL dinamis dengan entry price presisi 15M
                             dec = 8 if r["last_price"] < 0.01 else (6 if r["last_price"] < 1.0 else 4)
@@ -948,6 +975,7 @@ def run_scanner(
     df_top_picks["scan_time"] = datetime.datetime.fromtimestamp(
         signal_time / 1000, datetime.timezone.utc,
     ).strftime("%Y-%m-%d %H:%M:%S")
+    df_top_picks["signal_id"] = [signal_id(row["scan_time"], row["symbol"]) for _, row in df_top_picks.iterrows()]
     quality_report["signals"] = df_top_picks[[
         "symbol", "data_quality_status", "data_quality_notes", "rs_structure_status", "rs_1h_status",
     ]].to_dict(orient="records")
@@ -988,6 +1016,10 @@ def run_scanner(
             for _, r in df_top_picks.iterrows()
         ]
         cursor.executemany(insert_query, records)
+        cursor.executemany("""UPDATE scan_results SET support_level=?, score_penalty=?,
+            scoring_version=?, weights_json=?, signal_id=?, derivatives_status=? WHERE scan_time=? AND symbol=?""",
+            [(r["support_level"], r["score_penalty"], r["scoring_version"], r["weights_json"], r["signal_id"],
+              r.get("derivatives_status", "UNAVAILABLE"), r["scan_time"], r["symbol"]) for _, r in df_top_picks.iterrows()])
 
         # Masukkan juga draft ke signal_outcomes untuk Outcome Tracker
         outcomes_query = """
@@ -1013,6 +1045,8 @@ def run_scanner(
             for _, r in df_top_picks.iterrows()
         ]
         cursor.executemany(outcomes_query, outcomes_records)
+        cursor.executemany("UPDATE signal_outcomes SET signal_id=? WHERE scan_time=? AND symbol=?",
+            [(r["signal_id"], r["scan_time"], r["symbol"]) for _, r in df_top_picks.iterrows()])
         conn.commit()
         cursor.close()
 

@@ -37,10 +37,32 @@ def load_calibrated_config() -> Dict[str, Any]:
     if CONFIG_PATH.exists():
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
+                config = json.load(f)
+                return config if config.get("version") == SCORING_VERSION else {}
         except Exception:
             pass
     return {}
+
+
+BASE_WEIGHTS = {"structure": 25, "momentum": 30, "flow": 20, "derivatives": 15, "news": 10}
+SCORING_VERSION = "v2.1-normalized"
+
+
+def validate_weights(weights):
+    if set(weights) != set(BASE_WEIGHTS):
+        raise ValueError("weights must contain the five pillars.")
+    result = {name: float(value) for name, value in weights.items()}
+    if any(not math.isfinite(v) or v <= 0 for v in result.values()) or not math.isclose(sum(result.values()), 100):
+        raise ValueError("Positive finite weights must total 100.")
+    return result
+
+
+def compose_quant_score(components, weights=None, penalty=0.0):
+    """Raw subscores retain baseline units; weighting never changes setup thresholds."""
+    weights = validate_weights(BASE_WEIGHTS if weights is None else weights)
+    score = sum(max(0.0, min(BASE_WEIGHTS[k], float(components.get(k, 0)))) / BASE_WEIGHTS[k] * weights[k]
+                for k in BASE_WEIGHTS if k != "news")
+    return round(max(0.0, min(100 - weights["news"], score - float(penalty))), 6)
 
 
 # Bobot Modular Skoring 5 Pilar KripikTo v2 (Dapat Dikalibrasi via Outcome Tracker / Calibration Lab)
@@ -215,22 +237,27 @@ def calculate_dynamic_tp_sl(
     entry_price: float,
     support_level: float,
     atr_val: float,
-    dec: int = 4
+    dec: int = 4,
+    config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Menghitung TP & SL Dinamis Berbasis ATR & Support Struktural:
-    - TP1: Berdasarkan target kalibrasi empiris (default ~1.8x ATR atau min +4.2% s.d +5.5%)
+    - TP1: Max lantai target konfigurasi dan multiplier ATR (default 4.5%, 1.6x).
     - TP2: Berdasarkan 3.0x ATR (runner target)
     - SL : Support/ATR dibatasi risiko maksimum stop_loss_pct dari konfigurasi.
     """
     if entry_price <= 0:
         entry_price = 1e-8
 
-    cfg = load_calibrated_config()
+    cfg = load_calibrated_config() if config is None else config
     target_tp1_pct = float(cfg.get("target_profit_1_pct", 4.5))
     target_sl_pct = abs(float(cfg.get("stop_loss_pct", -4.8)))
     tp_mult = float(cfg.get("tp_atr_multiplier", 1.6))
     sl_mult = float(cfg.get("sl_atr_multiplier", 1.25))
+
+    if (not all(math.isfinite(v) for v in (entry_price, support_level, atr_val, target_tp1_pct, tp_mult, sl_mult))
+            or support_level <= 0 or atr_val <= 0 or target_tp1_pct <= 0 or tp_mult <= 0 or sl_mult <= 0):
+        raise ValueError("Invalid ATR trading-plan parameters.")
 
     if not math.isfinite(target_sl_pct) or not 0 < target_sl_pct < 100:
         raise ValueError("stop_loss_pct harus memiliki magnitudo antara 0 dan 100.")
@@ -252,7 +279,7 @@ def calculate_dynamic_tp_sl(
     tp1_pct = round(((tp1_price - entry_price) / entry_price) * 100.0, 2)
 
     # 3. Take Profit 2 (Runner): Minimal 7.5% atau 3.0x ATR
-    atr_tp2_dist = max(entry_price * 0.075, 3.0 * atr_val)
+    atr_tp2_dist = max(entry_price * 0.075, 3.0 * atr_val, atr_tp1_dist)
     tp2_price = round(entry_price + atr_tp2_dist, dec)
     tp2_pct = round(((tp2_price - entry_price) / entry_price) * 100.0, 2)
 

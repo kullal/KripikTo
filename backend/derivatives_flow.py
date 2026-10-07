@@ -9,12 +9,18 @@ Modul Aliran Pasar Derivatif (Funding Rate & Open Interest untuk Spot Scalping):
 3. Menyimpan data ke database SQLite lokal (kripto.db).
 """
 
+import math
 import sys
 import sqlite3
 import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional
 import requests
+
+try:
+    from backend.research_utils import database
+except ImportError:
+    from research_utils import database
 
 # Pastikan output utf-8 aman di terminal Windows
 if sys.platform == "win32" and sys.stdout.encoding.lower() != "utf-8":
@@ -31,7 +37,7 @@ DERIVATIVES_API_URL = "https://api.coingecko.com/api/v3/derivatives"
 
 def init_derivatives_db(db_path: str = DB_PATH) -> None:
     """Inisialisasi tabel derivatives_summary dan derivatives_history di SQLite."""
-    with sqlite3.connect(db_path) as conn:
+    with database(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS derivatives_summary (
@@ -64,7 +70,7 @@ def migrate_history_from_scans(db_path: str = DB_PATH) -> int:
     """Memindahkan riwayat funding rate & OI dari scan_results ke derivatives_history."""
     init_derivatives_db(db_path)
     count = 0
-    with sqlite3.connect(db_path) as conn:
+    with database(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT symbol, scan_time, funding_rate, open_interest_m 
@@ -118,8 +124,10 @@ def fetch_derivatives_summary(db_path: str = DB_PATH) -> Dict[str, Dict[str, Any
                         continue
 
                     try:
-                        fr = float(c.get("funding_rate") or 0.0)
-                        oi = float(c.get("open_interest") or 0.0)
+                        fr = float(c["funding_rate"])
+                        oi = float(c["open_interest"])
+                        if not math.isfinite(fr) or not math.isfinite(oi) or oi <= 0:
+                            continue
                         oi_m = round(oi / 1_000_000.0, 2)
                         
                         data_point = {
@@ -132,11 +140,11 @@ def fetch_derivatives_summary(db_path: str = DB_PATH) -> Dict[str, Dict[str, Any
                         results_map[sym] = data_point
                         records_to_insert.append((sym, round(fr, 4), oi, oi_m, now_utc_str))
                         history_to_insert.append((sym, now_ts_ms, now_utc_str, round(fr, 4), oi, oi_m))
-                    except (ValueError, TypeError):
+                    except (ValueError, TypeError, KeyError):
                         continue
     except Exception as e:
         print(f"[!] Gagal mengambil data derivatif online ({e}). Menggunakan data lokal di database.")
-        with sqlite3.connect(db_path) as conn:
+        with database(db_path) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT symbol, funding_rate, open_interest, open_interest_m, updated_at FROM derivatives_summary")
             for row in cursor.fetchall():
@@ -151,7 +159,7 @@ def fetch_derivatives_summary(db_path: str = DB_PATH) -> Dict[str, Dict[str, Any
 
     # Simpan ke SQLite (summary dan history time series)
     if records_to_insert:
-        with sqlite3.connect(db_path) as conn:
+        with database(db_path) as conn:
             cursor = conn.cursor()
             cursor.executemany("""
                 INSERT OR REPLACE INTO derivatives_summary (
@@ -168,65 +176,55 @@ def fetch_derivatives_summary(db_path: str = DB_PATH) -> Dict[str, Dict[str, Any
     return results_map
 
 
-def get_derivatives_deltas(symbol: str, db_path: str = DB_PATH) -> Dict[str, float]:
-    """
-    Menghitung perubahan dinamis pasar derivatif (Fase 4):
-    - delta_oi_1h : Perubahan Open Interest dalam 1 jam (dalam Juta USD)
-    - delta_oi_4h : Perubahan Open Interest dalam 4 jam (dalam Juta USD)
-    - delta_funding_1h : Perubahan Funding Rate dalam 1 jam
-    """
+def validate_derivative_snapshot(snapshot, now_ms=None):
+    now_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000) if now_ms is None else now_ms
+    if not snapshot:
+        return "UNAVAILABLE"
+    try:
+        timestamp = datetime.datetime.fromisoformat(snapshot["updated_at"])
+        timestamp = timestamp.replace(tzinfo=datetime.timezone.utc) if timestamp.tzinfo is None else timestamp.astimezone(datetime.timezone.utc)
+        age = now_ms - int(timestamp.timestamp() * 1000)
+        fr, oi = float(snapshot["funding_rate"]), float(snapshot["open_interest_m"])
+        if not math.isfinite(fr) or not math.isfinite(oi) or oi <= 0:
+            return "INVALID"
+        if age < 0 or age > 3_660_000:
+            return "STALE"
+        return "OK"
+    except (KeyError, TypeError, ValueError):
+        return "INVALID"
+
+
+def get_derivatives_deltas(symbol: str, db_path: str = DB_PATH, now_ms=None):
+    """Nearest historical snapshots within explicit 1H/4H tolerances; never substitute."""
     init_derivatives_db(db_path)
-    with sqlite3.connect(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT timestamp_ms, funding_rate, open_interest_m 
-            FROM derivatives_history 
-            WHERE symbol = ? 
-            ORDER BY timestamp_ms DESC 
-            LIMIT 20
-        """, (symbol,))
-        rows = cursor.fetchall()
-
-    if not rows:
-        return {
-            "delta_oi_1h": 0.0,
-            "delta_oi_4h": 0.0,
-            "delta_funding_1h": 0.0,
-            "funding_rate": 0.0,
-            "open_interest_m": 0.0
-        }
-
+    now_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000) if now_ms is None else now_ms
+    empty = {"delta_oi_1h": None, "delta_oi_4h": None, "delta_funding_1h": None,
+             "funding_rate": None, "open_interest_m": None,
+             "delta_1h_status": "UNAVAILABLE", "delta_4h_status": "UNAVAILABLE"}
+    with database(db_path) as conn:
+        rows = conn.execute("""SELECT timestamp_ms, funding_rate, open_interest_m
+            FROM derivatives_history WHERE symbol=? AND timestamp_ms BETWEEN ? AND ?
+            ORDER BY timestamp_ms DESC""", (symbol, now_ms - 5 * 3_600_000, now_ms)).fetchall()
+    if not rows or now_ms - rows[0][0] > 3_660_000:
+        return empty
     latest_ts, latest_fr, latest_oi = rows[0]
-    one_hour_ms = 3600 * 1000
-    four_hours_ms = 4 * 3600 * 1000
-
-    row_1h = None
-    row_4h = None
-
-    for ts, fr, oi in rows[1:]:
-        age = latest_ts - ts
-        # Cari snapshot yang mendekati 1 jam (antara 30 menit s.d 2 jam)
-        if 1800 * 1000 <= age <= 7200 * 1000 and row_1h is None:
-            row_1h = (ts, fr, oi)
-        # Cari snapshot yang mendekati 4 jam (antara 3 jam s.d 8 jam)
-        if 3 * 3600 * 1000 <= age <= 8 * 3600 * 1000 and row_4h is None:
-            row_4h = (ts, fr, oi)
-
-    # Jika tidak ada yang tepat 1h, ambil snapshot kedua terakhir jika usianya masuk akal
-    if row_1h is None and len(rows) > 1:
-        row_1h = rows[1]
-
-    d_oi_1h = round(latest_oi - row_1h[2], 2) if row_1h else 0.0
-    d_oi_4h = round(latest_oi - row_4h[2], 2) if row_4h else d_oi_1h
-    d_fr_1h = round(latest_fr - row_1h[1], 4) if row_1h else 0.0
-
-    return {
-        "delta_oi_1h": d_oi_1h,
-        "delta_oi_4h": d_oi_4h,
-        "delta_funding_1h": d_fr_1h,
-        "funding_rate": latest_fr,
-        "open_interest_m": latest_oi
-    }
+    if not all(x is not None and math.isfinite(float(x)) for x in (latest_fr, latest_oi)) or latest_oi <= 0:
+        return empty
+    result = dict(empty, funding_rate=latest_fr, open_interest_m=latest_oi)
+    for hours, tolerance in ((1, 900_000), (4, 1_800_000)):
+        target = latest_ts - hours * 3_600_000
+        candidates = [row for row in rows[1:] if abs(row[0] - target) <= tolerance
+                      and all(value is not None and math.isfinite(float(value)) for value in row)
+                      and row[2] > 0]
+        if not candidates:
+            continue
+        timestamp, fr, oi = min(candidates, key=lambda r: abs(r[0] - target))
+        result[f"delta_oi_{hours}h"] = round(latest_oi - oi, 2)
+        result[f"delta_{hours}h_status"] = "ALIGNED"
+        result[f"delta_{hours}h_elapsed_ms"] = latest_ts - timestamp
+        if hours == 1:
+            result["delta_funding_1h"] = round(latest_fr - fr, 4)
+    return result
 
 
 if __name__ == "__main__":
