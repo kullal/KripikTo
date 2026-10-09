@@ -25,6 +25,11 @@ from typing import Optional, List, Dict, Any
 import pandas as pd
 import numpy as np
 
+try:
+    from backend.scoring import RAW_MAX, SCORING_VERSION, score_snapshot
+except ImportError:
+    from scoring import RAW_MAX, SCORING_VERSION, score_snapshot
+
 # Pastikan output utf-8 aman di terminal Windows
 if sys.platform == "win32" and sys.stdout.encoding.lower() != "utf-8":
     try:
@@ -225,6 +230,15 @@ def init_scanner_db(db_path: str = DB_PATH) -> None:
                     cursor.execute(f"ALTER TABLE signal_outcomes ADD COLUMN {col} {ctype}")
                 except Exception:
                     pass
+        snapshot_columns = {"scoring_version": "TEXT", "weights_json": "TEXT",
+                            "score_components_json": "TEXT", "score_penalty": "REAL",
+                            "support_level": "REAL", "macro_score": "REAL",
+                            "trigger_type": "TEXT", "breakout_level": "REAL"}
+        for table in ("scan_results", "signal_outcomes"):
+            existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            for column, kind in snapshot_columns.items():
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
         conn.commit()
         cursor.close()
 
@@ -544,7 +558,7 @@ def run_scanner(
             structure_score -= 5
             signals.append(f"UNDERPERFORM_BTC_{interval.upper()} (RS:{rs_4h:+.1f}%)")
 
-        structure_score = max(0, min(DEFAULT_WEIGHTS["structure"], structure_score))
+        structure_score = max(0, min(RAW_MAX["structure"], structure_score))
 
         # --- PILAR 2: KINETIK MOMENTUM 1H (Maksimal 30 Poin) ---
         momentum_score = 0
@@ -597,7 +611,7 @@ def run_scanner(
             momentum_score += 3
             signals.append("RSI_OVERSOLD_REBOUND")
 
-        momentum_score = max(0, min(DEFAULT_WEIGHTS["momentum"], momentum_score))
+        momentum_score = max(0, min(RAW_MAX["momentum"], momentum_score))
         if sym not in feat_1h_map:
             momentum_score = 0
 
@@ -617,7 +631,7 @@ def run_scanner(
             flow_score += 5
             signals.append("WHALE_DIVERGENCE (Nyicil Diam-diam)")
 
-        flow_score = max(0, min(DEFAULT_WEIGHTS["flow"], flow_score))
+        flow_score = max(0, min(RAW_MAX["flow"], flow_score))
 
         # --- PILAR 4: DERIVATIF & DINAMIKA OI (Maksimal 15 Poin) ---
         derivative_score = 0
@@ -641,7 +655,7 @@ def run_scanner(
             derivative_score += 3
             signals.append(f"BIG_OI_SHORT_POOL (${oi_m}M)")
 
-        derivative_score = max(0, min(DEFAULT_WEIGHTS["derivatives"], derivative_score))
+        derivative_score = max(0, min(RAW_MAX["derivatives"], derivative_score))
 
         # --- PILAR 5: MAKRO BAROMETER (Maksimal 10 Poin) ---
         macro_score = 5 # Baseline
@@ -665,17 +679,21 @@ def run_scanner(
         macro_score = max(0, min(DEFAULT_WEIGHTS["news"], macro_score))
 
         # --- SKOR TOTAL V2 KOMPOSIT ---
-        v2_score = structure_score + momentum_score + flow_score + derivative_score + macro_score
+        score_penalty = 0
 
         # Penalti risiko pompaan ekstrem
         if change_24h > 35.0:
-            v2_score -= 15
+            score_penalty += 15
             signals.append("RISIKO_PUCUK (Naik >35%)")
         if rsi >= 80.0:
-            v2_score -= 10
+            score_penalty += 10
             signals.append("RSI_OVERBOUGHT_EXTREME")
 
-        v2_score = max(0, min(100, v2_score))
+        v2_score, score_components = score_snapshot({
+            "structure_score": structure_score, "momentum_score": momentum_score,
+            "flow_score": flow_score, "derivative_score": derivative_score,
+            "macro_score": macro_score, "score_penalty": score_penalty,
+        }, DEFAULT_WEIGHTS)
 
         # Filter minimum score berdasarkan v2_score
         if v2_score < min_score:
@@ -758,9 +776,9 @@ def run_scanner(
             "open_interest_m": oi_m,
             "rsi14": round(rsi, 1),
             "vol_ratio": round(vol_ratio, 2),
-            "score": int(v2_score),
+            "score": v2_score,
             "v1_score": int(v1_score),
-            "v2_score": int(v2_score),
+            "v2_score": v2_score,
             "setup_type": setup_type,
             "entry_status": entry_status,
             "structure_score": int(structure_score),
@@ -768,6 +786,11 @@ def run_scanner(
             "flow_score": int(flow_score),
             "derivative_score": int(derivative_score),
             "macro_score": int(macro_score),
+            "score_penalty": score_penalty, "scoring_version": SCORING_VERSION,
+            "weights_json": json.dumps(DEFAULT_WEIGHTS, sort_keys=True),
+            "score_components_json": json.dumps(score_components, sort_keys=True),
+            "support_level": support_level,
+            "trigger_type": "NONE", "breakout_level": None,
             "delta_oi_1h": delta_oi_1h,
             "delta_oi_4h": delta_oi_4h,
             "delta_funding_1h": delta_funding_1h,
@@ -873,6 +896,8 @@ def run_scanner(
                         continue
                     if t_info:
                         t_status = t_info["trigger_status"]
+                        df_top_picks.at[idx, "trigger_type"] = t_info.get("trigger_type", "UNKNOWN")
+                        df_top_picks.at[idx, "breakout_level"] = t_info.get("breakout_level")
                         t_reason = t_info["trigger_reason"]
                         t_tags = t_info.get("tags", [])
 
@@ -887,6 +912,7 @@ def run_scanner(
                             df_top_picks.at[idx, "buy_high"] = ref_high
                             df_top_picks.at[idx, "buy_area"] = f"${ref_low} - ${ref_high}"
                             df_top_picks.at[idx, "entry_price"] = ref_entry
+                            df_top_picks.at[idx, "support_level"] = t_info["micro_support"]
 
                             # Hitung ulang TP/SL dinamis dengan entry price presisi 15M
                             dec = 8 if r["last_price"] < 0.01 else (6 if r["last_price"] < 1.0 else 4)
@@ -1013,6 +1039,14 @@ def run_scanner(
             for _, r in df_top_picks.iterrows()
         ]
         cursor.executemany(outcomes_query, outcomes_records)
+        metadata = ["scoring_version", "weights_json", "score_components_json", "score_penalty",
+                    "support_level", "macro_score", "trigger_type", "breakout_level"]
+        for table in ("scan_results", "signal_outcomes"):
+            for _, r in df_top_picks.iterrows():
+                values = [None if pd.isna(r[k]) else r[k] for k in metadata]
+                conn.execute(f"UPDATE {table} SET " + ", ".join(f"{k}=?" for k in metadata)
+                             + " WHERE scan_time=? AND symbol=?", values + [r["scan_time"], r["symbol"]])
+
         conn.commit()
         cursor.close()
 

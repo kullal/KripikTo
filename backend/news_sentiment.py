@@ -415,7 +415,7 @@ def run_news_sentiment_pipeline(
 
     for i, item in enumerate(picks_to_analyze):
         sym = item["symbol"]
-        tech_score = int(item["score"])
+        tech_score = float(item["score"])
         fr = float(item.get("funding_rate", 0.0))
         oi_m = float(item.get("open_interest_m", 0.0))
         print(f"    [{i+1}/{len(picks_to_analyze)}] Memeriksa berita untuk {sym} (Skor Teknikal: {tech_score}, FR: {fr:+.3f}%)...")
@@ -440,7 +440,7 @@ def run_news_sentiment_pipeline(
         catalyst = sentiment_res["catalyst"]
         crypto_risk = sentiment_res["crypto_risk"]
 
-        v2_score = int(item.get("v2_score", tech_score))
+        v2_score = float(item.get("v2_score", tech_score))
         setup_type = str(item.get("setup_type", "NO_SETUP"))
         entry_status = str(item.get("entry_status", "WAIT"))
 

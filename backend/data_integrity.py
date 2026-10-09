@@ -11,7 +11,7 @@ INTERVAL_MS = {"15m": 900_000, "1h": 3_600_000, "2h": 7_200_000,
                "4h": 14_400_000, "1d": 86_400_000}
 STRUCTURE_MIN_CANDLES = 51  # Full MA50 plus a previous close.
 MOMENTUM_MIN_CANDLES = 35  # Full ATR14 and 20 ATR observations.
-TRIGGER_MIN_CANDLES = 21  # Previous 20-bar high plus the trigger candle.
+TRIGGER_MIN_CANDLES = 29  # 20-bar resistance + up to 8 later retest candles.
 FRESHNESS_GRACE_MS = 60_000
 ReturnKey = Tuple[int, int, int, int]
 

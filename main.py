@@ -31,9 +31,10 @@ def run_all(
     top_picks_limit: int = 15,
     top_liquid_limit: int = 200,
     skip_download: bool = False,
-    mtf: bool = True
+    mtf: bool = True,
+    news_enabled: bool = True
 ) -> None:
-    """Menjalankan seluruh tahapan analisis kripto secara terpadu."""
+    """Menjalankan analisis kripto; news_enabled=False melewati RSS dan Gemini."""
     print("\n" + "=" * 100)
     mode_str = "MULTI-TIMEFRAME (4H + 1H + 15M)" if mtf else f"SINGLE TIMEFRAME [{interval.upper()}]"
     print(f"🚀 MEMULAI SISTEM ANALISIS KRIPTO (KRIPIKTO) | MODE: {mode_str}")
@@ -68,6 +69,11 @@ def run_all(
         return
 
     print_scan_report(scan_picks)
+
+    if not news_enabled:
+        print("\n[*] Analisis berita dinonaktifkan (news_enabled=False).")
+        print("✅ Scan teknikal selesai! Hasil & Trading Plan tersimpan di scan_latest.json dan database SQLite.")
+        return
 
     # -------------------------------------------------------------
     # TAHAP 3: GLOBAL NEWS SCRAPING + GEMINI LLM SENTIMENT & RISK GUARD
@@ -110,6 +116,11 @@ if __name__ == "__main__":
         help="Lewati unduhan data jika database kripto.db sudah diperbarui baru-baru ini"
     )
     parser.add_argument(
+        "--no-news",
+        action="store_true",
+        help="Lewati pengambilan berita RSS dan analisis Gemini; hanya jalankan scan teknikal"
+    )
+    parser.add_argument(
         "--no-mtf",
         action="store_true",
         help="Nonaktifkan unduhan multi-timeframe (hanya unduh single interval)"
@@ -121,5 +132,6 @@ if __name__ == "__main__":
         top_picks_limit=args.top,
         top_liquid_limit=args.liquid,
         skip_download=args.skip_download,
-        mtf=not args.no_mtf
+        mtf=not args.no_mtf,
+        news_enabled=not args.no_news
     )

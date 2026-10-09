@@ -24,6 +24,11 @@ import pandas as pd
 import numpy as np
 
 try:
+    from backend.scoring import BASE_WEIGHTS, SCORING_VERSION
+except ImportError:
+    from scoring import BASE_WEIGHTS, SCORING_VERSION
+
+try:
     from backend.data_integrity import aligned_relative_strength
 except ImportError:
     from data_integrity import aligned_relative_strength
@@ -37,7 +42,9 @@ def load_calibrated_config() -> Dict[str, Any]:
     if CONFIG_PATH.exists():
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
+                config = json.load(f)
+                if config.get("scoring_version") == SCORING_VERSION and config.get("validated") is True:
+                    return config
         except Exception:
             pass
     return {}
@@ -45,13 +52,7 @@ def load_calibrated_config() -> Dict[str, Any]:
 
 # Bobot Modular Skoring 5 Pilar KripikTo v2 (Dapat Dikalibrasi via Outcome Tracker / Calibration Lab)
 _CALIBRATED_CFG = load_calibrated_config()
-DEFAULT_WEIGHTS = _CALIBRATED_CFG.get("weights", {
-    "structure": 25,
-    "momentum": 30,
-    "flow": 20,
-    "derivatives": 15,
-    "news": 10
-})
+DEFAULT_WEIGHTS = _CALIBRATED_CFG.get("weights", BASE_WEIGHTS.copy())
 
 
 def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -215,7 +216,8 @@ def calculate_dynamic_tp_sl(
     entry_price: float,
     support_level: float,
     atr_val: float,
-    dec: int = 4
+    dec: int = 4,
+    config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Menghitung TP & SL Dinamis Berbasis ATR & Support Struktural:
@@ -226,7 +228,7 @@ def calculate_dynamic_tp_sl(
     if entry_price <= 0:
         entry_price = 1e-8
 
-    cfg = load_calibrated_config()
+    cfg = load_calibrated_config() if config is None else config
     target_tp1_pct = float(cfg.get("target_profit_1_pct", 4.5))
     target_sl_pct = abs(float(cfg.get("stop_loss_pct", -4.8)))
     tp_mult = float(cfg.get("tp_atr_multiplier", 1.6))
@@ -276,7 +278,7 @@ def evaluate_15m_trigger(
     Mengevaluasi Tactical Entry Trigger pada lilin 15M tertutup (KripikTo v2 Fase 5):
     Mendeteksi titik eksekusi mikro yang presisi:
     1. BREAKOUT_TRIGGER: Close > 20-bar 15M High + Volume 15M Spike >= 1.25x + RSI < 78.
-    2. RETEST_TRIGGER: Harga mengetes MA20 15M (jarak <= 0.8%) dengan pantulan bullish / lower-wick pinbar >= 35%.
+    2. RETEST_TRIGGER: Breakout terkonfirmasi dalam 8 candle terakhir, lalu test resistance lama dan close bullish di atasnya.
     3. OVERBOUGHT_WARNING: RSI 15M >= 78 atau lonjakan lilin tunggal >= 4% -> STATUS: EXTENDED (Tunggu pullback).
     4. BREAKDOWN_WARNING: Close < MA20 15M * 0.985 -> STATUS: FAILED (Gagal bertahan di mikro support).
     5. CONSOLIDATING: Bergerak di atas MA20 15M -> STATUS: WAIT (Menunggu pemicu breakout/retest).
@@ -287,7 +289,7 @@ def evaluate_15m_trigger(
     df = df_15m.copy()
     df["ma20_15m"] = df.groupby("symbol")["close"].transform(lambda x: x.rolling(20, min_periods=5).mean())
     df["vol_ma20_15m"] = df.groupby("symbol")["volume"].transform(lambda x: x.rolling(20, min_periods=5).mean())
-    df["high20_15m"] = df.groupby("symbol")["high"].transform(lambda x: x.shift(1).rolling(20, min_periods=5).max())
+    df["high20_15m"] = df.groupby("symbol")["high"].transform(lambda x: x.shift(1).rolling(20, min_periods=20).max())
     df["low20_15m"] = df.groupby("symbol")["low"].transform(lambda x: x.shift(1).rolling(20, min_periods=5).min())
     df["rsi14_15m"] = df.groupby("symbol")["close"].transform(lambda x: calculate_rsi(x, period=14))
     df["vol_ratio_15m"] = df["volume"] / df["vol_ma20_15m"].replace(0, np.nan)
@@ -306,14 +308,25 @@ def evaluate_15m_trigger(
         high20 = float(row["high20_15m"]) if pd.notnull(row["high20_15m"]) else high
         rsi_val = float(row["rsi14_15m"]) if pd.notnull(row["rsi14_15m"]) else 50.0
 
-        candle_range = max(high - low, 1e-9)
-        lower_wick = (open_p - low) if close >= open_p else (close - low)
-        lower_wick_ratio = lower_wick / candle_range
-
         # Deteksi kondisi pemicu taktis 15M
         is_breakout = (close > high20 and high20 > 0 and vol_r >= 1.25 and rsi_val < 78.0)
-        dist_to_ma20 = abs(close - ma20) / ma20 if ma20 > 0 else 0.0
-        is_retest_bounce = (dist_to_ma20 <= 0.008 and (close >= open_p or lower_wick_ratio >= 0.35) and 45.0 <= rsi_val <= 68.0)
+        # A MA pullback is not a breakout-retest. Require a previous confirmed
+        # breakout and a later test of that frozen resistance, with no failed close.
+        history = df[df["symbol"] == sym].iloc[:-1]
+        retest_level = None
+        for position in range(max(0, len(history) - 8), len(history)):
+            previous = history.iloc[position]
+            level = previous["high20_15m"]
+            if (pd.notna(level) and previous["close"] > level
+                    and previous["vol_ratio_15m"] >= 1.25
+                    and previous["rsi14_15m"] < 78
+                    and (previous["close"] / previous["open"] - 1) * 100 < 4):
+                intervening = history.iloc[position + 1:]
+                if (intervening["close"] < level).any():
+                    continue
+                if low <= level <= high and close > level and close >= open_p:
+                    retest_level = float(level)
+        is_retest_bounce = retest_level is not None
         is_overbought = (rsi_val >= 78.0 or ((close - open_p) / open_p * 100.0) >= 4.0)
         is_breakdown = (close < ma20 * 0.985)
 
@@ -332,8 +345,8 @@ def evaluate_15m_trigger(
             tags.append("15M_BREAKOUT_CONFIRMED")
         elif is_retest_bounce:
             status = "TRIGGERED"
-            reason = f"🎯 15M_RETEST_BOUNCE (Dekat MA20, Wick: {int(lower_wick_ratio*100)}%)"
-            tags.append("15M_RETEST_BOUNCE_CONFIRMED")
+            reason = f"🎯 15M_BREAKOUT_RETEST (Level: {retest_level})"
+            tags.append("15M_BREAKOUT_RETEST_CONFIRMED")
         else:
             status = "WAIT"
             reason = f"⏳ 15M_KONSOLIDASI (RSI: {rsi_val:.0f}, Menunggu Pemicu)"
@@ -348,6 +361,9 @@ def evaluate_15m_trigger(
             refined_buy_low = round(close * 0.988, dec)
 
         trigger_map[sym] = {
+            "trigger_type": ("BREAKOUT" if status == "TRIGGERED" and is_breakout
+                             else "BREAKOUT_RETEST" if status == "TRIGGERED" and is_retest_bounce else "NONE"),
+            "breakout_level": float(high20) if is_breakout else retest_level,
             "trigger_status": status,
             "trigger_reason": reason,
             "vol_ratio_15m": round(vol_r, 2),

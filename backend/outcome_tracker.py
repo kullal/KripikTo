@@ -29,6 +29,14 @@ from typing import Dict, List, Any, Optional, Tuple
 import requests
 import pandas as pd
 import numpy as np
+from contextlib import closing
+
+try:
+    from backend.replay import Costs, REPLAY_VERSION, replay_trade, timestamp_ms, summarize
+    from backend.replay_store import save_candles
+except ImportError:
+    from replay import Costs, REPLAY_VERSION, replay_trade, timestamp_ms, summarize
+    from replay_store import save_candles
 
 # Pastikan output utf-8 aman di terminal Windows
 if sys.platform == "win32" and sys.stdout.encoding.lower() != "utf-8":
@@ -48,7 +56,7 @@ BINANCE_API_BASE = "https://data-api.binance.vision"
 
 def init_outcome_tracker_db(db_path: str = DB_PATH) -> None:
     """Inisialisasi dan migrasi tabel signal_outcomes di SQLite."""
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         cursor = conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS signal_outcomes (
@@ -90,6 +98,11 @@ def init_outcome_tracker_db(db_path: str = DB_PATH) -> None:
         cursor.execute("PRAGMA table_info(signal_outcomes)")
         existing_cols = {col[1] for col in cursor.fetchall()}
         required_cols = [
+            ("exit_price", "REAL"), ("net_return_pct", "REAL"), ("gross_return_pct", "REAL"),
+            ("replay_version", "TEXT"), ("replay_interval", "TEXT"),
+            ("fee_bps", "REAL"), ("slippage_bps", "REAL"), ("replay_note", "TEXT"),
+            ("fill_timeout_hours", "REAL"), ("trade_timeout_hours", "REAL"),
+            ("execution_eligible", "INTEGER"), ("data_quality_status", "TEXT"),
             ("buy_low", "REAL"),
             ("buy_high", "REAL"),
             ("v2_score", "INTEGER"),
@@ -135,96 +148,41 @@ def parse_buy_area_str(buy_area: str) -> Tuple[float, float]:
     return 0.0, 0.0
 
 
+def is_trade_eligible(signal):
+    """Explicit final blocks win; technical-only entry requires a valid triggered snapshot."""
+    return (signal.get("entry_status") == "TRIGGERED"
+            and signal.get("data_quality_status") == "OK"
+            and signal.get("execution_eligible") != 0)
+
+
 def import_signals_from_history(db_path: str = DB_PATH) -> int:
-    """
-    Mengimpor sinyal dari scan_results dan final_recommendations.json ke signal_outcomes
-    sehingga data masa lalu (termasuk kasus PARTI) dapat dievaluasi secara otomatis.
-    """
     init_outcome_tracker_db(db_path)
-    imported_count = 0
-
-    with sqlite3.connect(db_path) as conn:
-        cursor = conn.cursor()
-
-        # 1. Impor dari scan_results SQLite
-        try:
-            cursor.execute("""
-                SELECT scan_time, symbol, interval, buy_area, buy_low, buy_high, entry_price,
-                       stop_loss, tp1, tp2, atr14, v1_score, v2_score, setup_type, entry_status,
-                       structure_score, momentum_score, flow_score, derivative_score,
-                       rs_4h, rs_1h, btc_return_4h, btc_return_1h
-                FROM scan_results
-            """)
-            rows = cursor.fetchall()
-            for r in rows:
-                (scan_t, sym, iv, area, b_low, b_high, ep, sl, tp1, tp2, atr,
-                 v1_s, v2_s, stype, estatus, str_s, mom_s, flw_s, der_s, rs4, rs1, btc4, btc1) = r
-                if not b_low or not b_high or b_low <= 0:
-                    b_low, b_high = parse_buy_area_str(area or "")
-                if not ep or ep <= 0:
-                    ep = (b_low + b_high) / 2.0 if (b_low and b_high) else 0.0
-
-                # Masukkan sinyal baru jika belum ada
-                cursor.execute("""
-                    INSERT OR IGNORE INTO signal_outcomes (
-                        scan_time, symbol, interval, buy_low, buy_high, entry_price,
-                        stop_loss, tp1, tp2, atr14, v1_score, v2_score, setup_type, entry_status,
-                        structure_score, momentum_score, flow_score, derivative_score,
-                        rs_4h, rs_1h, btc_return_4h, btc_return_1h, result
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
-                """, (scan_t, sym, iv or "4h", b_low, b_high, ep, sl, tp1, tp2, atr,
-                      v1_s, v2_s, stype, estatus, str_s, mom_s, flw_s, der_s, rs4, rs1, btc4, btc1))
-                if cursor.rowcount > 0:
-                    imported_count += 1
-                else:
-                    # Perbarui metadata v2 tanpa menimpa hasil evaluasi empiris yang sudah ada
-                    cursor.execute("""
-                        UPDATE signal_outcomes
-                        SET v2_score = COALESCE(?, v2_score),
-                            setup_type = COALESCE(?, setup_type),
-                            entry_status = COALESCE(?, entry_status),
-                            structure_score = COALESCE(?, structure_score),
-                            momentum_score = COALESCE(?, momentum_score),
-                            flow_score = COALESCE(?, flow_score),
-                            derivative_score = COALESCE(?, derivative_score)
-                        WHERE scan_time = ? AND symbol = ?
-                    """, (v2_s, stype, estatus, str_s, mom_s, flw_s, der_s, scan_t, sym))
-            conn.commit()
-        except Exception:
-            pass
-
-    # 2. Impor dari final_recommendations.json (jika ada)
-    if Path(RECOMMENDATIONS_JSON).exists():
-        try:
-            with open(RECOMMENDATIONS_JSON, "r", encoding="utf-8") as f:
-                recs = json.load(f)
-            with sqlite3.connect(db_path) as conn:
-                cursor = conn.cursor()
-                for item in recs:
-                    scan_t = item.get("scan_time", "")
-                    sym = item.get("symbol", "")
-                    if not scan_t or not sym:
-                        continue
-                    b_low, b_high = parse_buy_area_str(item.get("buy_area", ""))
-                    ep = (b_low + b_high) / 2.0 if (b_low and b_high) else float(item.get("last_price", 0.0))
-                    sl = float(item.get("stop_loss", 0.0))
-                    tp1 = float(item.get("tp1", 0.0))
-                    tp2 = float(item.get("tp2", 0.0))
-                    v1_s = int(item.get("tech_score", 0))
-
-                    cursor.execute("""
-                        INSERT OR IGNORE INTO signal_outcomes (
-                            scan_time, symbol, interval, buy_low, buy_high, entry_price,
-                            stop_loss, tp1, tp2, v1_score, result
-                        ) VALUES (?, ?, '4h', ?, ?, ?, ?, ?, ?, ?, 'PENDING')
-                    """, (scan_t, sym, b_low, b_high, ep, sl, tp1, tp2, v1_s))
-                    if cursor.rowcount > 0:
-                        imported_count += 1
-                conn.commit()
-        except Exception:
-            pass
-
-    return imported_count
+    count = 0
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(signal_outcomes)")}
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE name='scan_results'").fetchone():
+            for row in conn.execute("SELECT * FROM scan_results").fetchall():
+                record = dict(row)
+                # Snapshot metadata only; never overwrite recorded outcomes.
+                fields = [k for k in record if k in columns and k not in
+                          ("result", "is_filled", "fill_price", "fill_time", "evaluated_at")]
+                sql = "INSERT OR IGNORE INTO signal_outcomes (" + ",".join(fields) + ") VALUES (" + ",".join("?" for _ in fields) + ")"
+                count += conn.execute(sql, [record[k] for k in fields]).rowcount
+                metadata = [k for k in ("entry_status", "data_quality_status", "execution_eligible") if k in record]
+                if metadata:
+                    conn.execute("UPDATE signal_outcomes SET " + ",".join(k + "=?" for k in metadata)
+                                 + " WHERE scan_time=? AND symbol=?",
+                                 [record[k] for k in metadata] + [record["scan_time"], record["symbol"]])
+        # Do not mix the production JSON into experiments using a different database.
+        if str(Path(db_path).resolve()) == str(Path(DB_PATH).resolve()) and Path(RECOMMENDATIONS_JSON).exists():
+            recs = json.loads(Path(RECOMMENDATIONS_JSON).read_text(encoding="utf-8"))
+            for record in recs:
+                if "execution_eligible" in record:
+                    conn.execute("UPDATE signal_outcomes SET execution_eligible=? WHERE scan_time=? AND symbol=?",
+                                 (record["execution_eligible"], record.get("scan_time"), record.get("symbol")))
+        conn.commit()
+    return count
 
 
 def fetch_subsequent_klines(
@@ -277,193 +235,31 @@ TIME_STOP_HOURS = 6.0  # Sesuai spesifikasi Fase 3.6 (Momentum Scalping Time Sto
 
 def evaluate_single_signal(
     signal: Dict[str, Any],
-    sim_interval: str = "1h",
-    fill_timeout_hours: int = 24,
-    trade_timeout_hours: float = TIME_STOP_HOURS
+    sim_interval: str = "15m",
+    fill_timeout_hours: float = 2.0,
+    trade_timeout_hours: float = TIME_STOP_HOURS,
+    costs=None,
+    db_path=None,
 ) -> Dict[str, Any]:
-    """
-    Merekonstruksi pergerakan harga historis sejak waktu scan:
-    1. Fase Limit Order: Entry eksplisit harus berada di rentang low/high candle.
-    2. Fase Aktif: Hitung MFE, MAE, deteksi TP1/TP2 vs SL (kronologis lilin per lilin).
-    3. Fase Ambiguous: Jika TP dan SL tersentuh di lilin yang sama -> AMBIGUOUS (tanpa mengarang urutan).
-    4. Fase Timeout: Keluar jika melebihi Time-Stop 6 jam (mencegah modal tersandera koin sideways).
-    """
-    scan_t_str = signal["scan_time"]
-    sym = signal["symbol"]
-    buy_low = float(signal.get("buy_low") or 0.0)
-    buy_high = float(signal.get("buy_high") or 0.0)
-    entry_p = float(signal.get("entry_price") or 0.0)
-    sl = float(signal.get("stop_loss") or 0.0)
-    tp1 = float(signal.get("tp1") or 0.0)
-    tp2 = float(signal.get("tp2") or 0.0)
-
-    # Konversi waktu scan ke milidetik UTC
-    try:
-        dt_scan = datetime.datetime.strptime(scan_t_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=datetime.timezone.utc)
-    except Exception:
-        dt_scan = datetime.datetime.fromisoformat(scan_t_str).replace(tzinfo=datetime.timezone.utc)
-    start_ms = int(dt_scan.timestamp() * 1000)
-
-    klines = fetch_subsequent_klines(sym, start_ms, interval=sim_interval, limit=500)
-    if not klines:
-        return signal
-
-    # Replay from scan time on every evaluation. Previous partial results must
-    # not treat candles before the fill as an already active position.
-    is_filled = 0
-    fill_time_str = ""
-    fill_price = 0.0
-    fill_dt = None
-    mfe_pct = 0.0
-    mae_pct = 0.0
-    result = "PENDING"
-    result_time = ""
-    dur_hours = 0.0
-    dur_candles = 0
-
-    ret_12h = None
-    ret_24h = None
-    ret_48h = None
-
-    # Legacy signals may omit entry_price; use the declared buy area only.
-    if entry_p <= 0:
-        if 0 < buy_low <= buy_high:
-            entry_p = (buy_low + buy_high) / 2.0
-        else:
-            entry_p = buy_high if buy_high > 0 else buy_low
-    if entry_p <= 0:
-        return signal
-
-    fill_candle_idx = -1
-
-    for idx, c in enumerate(klines):
-        c_dt = datetime.datetime.strptime(c["datetime_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=datetime.timezone.utc)
-        c_high = c["high"]
-        c_low = c["low"]
-        c_close = c["close"]
-        c_open = c["open"]
-        if c_dt < dt_scan:
-            continue
-
-        # --- TAHAP 1: MENUNGGU LIMIT ORDER TERISI (FILL) ---
-        if not is_filled:
-            elapsed_since_scan = (c_dt - dt_scan).total_seconds() / 3600.0
-            if elapsed_since_scan >= fill_timeout_hours:
-                result = "UNFILLED"
-                result_time = c["datetime_utc"]
-                break
-            # Require evidence that the declared limit price was touched.
-            # OHLC alone does not prove a fill at that price across a gap.
-            if c_low <= entry_p <= c_high:
-                is_filled = 1
-                # Use the scanner's declared entry price. Do not infer an intrabar fill price.
-                fill_price = entry_p
-                fill_time_str = c["datetime_utc"]
-                fill_dt = c_dt
-                fill_candle_idx = idx
-
-                # OHLC cannot reveal whether fill happened before TP/SL on this candle.
-                # Mark the event ambiguous instead of inventing the intrabar order.
-                same_candle_tp = (tp1 > 0 and c_high >= tp1) or (tp2 > 0 and c_high >= tp2)
-                same_candle_sl = sl > 0 and c_low <= sl
-                if same_candle_tp or same_candle_sl:
-                    result = "AMBIGUOUS"
-                    result_time = c["datetime_utc"]
-                    dur_hours = 0.0
-                    dur_candles = 0
-                    break
-
-                # This candle only proves that the order was touched.
-                # MFE/MAE/TP/SL evaluation starts on the next closed candle.
-                continue
-            else:
-                continue
-
-        # --- TAHAP 2: TRADE AKTIF SETELAH TERISI (IN POSITION) ---
-        if is_filled and fill_price > 0:
-            elapsed_from_fill = (c_dt - fill_dt).total_seconds() / 3600.0 if fill_dt else 0.0
-            # A candle starting at the deadline is outside the trade window.
-            # Its later high/low cannot count as a TP/SL within that window.
-            if elapsed_from_fill >= trade_timeout_hours:
-                result = "TIMEOUT"
-                result_time = c["datetime_utc"]
-                dur_hours = round(elapsed_from_fill, 1)
-                dur_candles = idx - (fill_candle_idx if fill_candle_idx >= 0 else 0)
-                break
-            
-            # Hitung MFE (% Keuntungan Maksimal yang sempat tersentuh)
-            cur_gain = ((c_high - fill_price) / fill_price) * 100.0
-            if cur_gain > mfe_pct:
-                mfe_pct = round(cur_gain, 2)
-
-            # Hitung MAE (% Drawdown Terburuk yang dialami)
-            cur_drawdown = ((c_low - fill_price) / fill_price) * 100.0
-            if cur_drawdown < mae_pct:
-                mae_pct = round(cur_drawdown, 2)
-
-            # Catat return periodik (12h, 24h, 48h)
-            if ret_12h is None and elapsed_from_fill >= 12.0:
-                ret_12h = round(((c_close - fill_price) / fill_price) * 100.0, 2)
-            if ret_24h is None and elapsed_from_fill >= 24.0:
-                ret_24h = round(((c_close - fill_price) / fill_price) * 100.0, 2)
-            if ret_48h is None and elapsed_from_fill >= 48.0:
-                ret_48h = round(((c_close - fill_price) / fill_price) * 100.0, 2)
-
-            # Cek Pemicu TP dan SL:
-            hit_tp1 = (tp1 > 0 and c_high >= tp1)
-            hit_tp2 = (tp2 > 0 and c_high >= tp2)
-            hit_sl = (sl > 0 and c_low <= sl)
-
-            # Jika terjadi flash spike dua arah di lilin yang sama (Spesifikasi 3.5: AMBIGUOUS, jangan mengarang urutan)
-            if (hit_tp1 or hit_tp2) and hit_sl:
-                result = "AMBIGUOUS"
-                result_time = c["datetime_utc"]
-                dur_hours = round(elapsed_from_fill, 1)
-                dur_candles = idx - (fill_candle_idx if fill_candle_idx >= 0 else 0)
-                break
-            elif hit_tp2:
-                result = "TP2_HIT"
-                result_time = c["datetime_utc"]
-                dur_hours = round(elapsed_from_fill, 1)
-                dur_candles = idx - (fill_candle_idx if fill_candle_idx >= 0 else 0)
-                break
-            elif hit_tp1:
-                result = "TP1_HIT"
-                result_time = c["datetime_utc"]
-                dur_hours = round(elapsed_from_fill, 1)
-                dur_candles = idx - (fill_candle_idx if fill_candle_idx >= 0 else 0)
-                break
-            elif hit_sl:
-                result = "SL_HIT"
-                result_time = c["datetime_utc"]
-                dur_hours = round(elapsed_from_fill, 1)
-                dur_candles = idx - (fill_candle_idx if fill_candle_idx >= 0 else 0)
-                break
-
-    now_utc_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-    # Update objek sinyal
-    signal["is_filled"] = is_filled
-    signal["fill_time"] = fill_time_str
-    signal["fill_price"] = fill_price
-    signal["result"] = result
-    signal["result_time"] = result_time
-    signal["duration_hours"] = dur_hours
-    signal["duration_candles"] = dur_candles
-    signal["mfe_pct"] = mfe_pct
-    signal["mae_pct"] = mae_pct
-    signal["return_12h_pct"] = ret_12h
-    signal["return_24h_pct"] = ret_24h
-    signal["return_48h_pct"] = ret_48h
-    signal["evaluated_at"] = now_utc_str
-
-    return signal
+    """Replay closed candles; retain the complete forward path for later experiments."""
+    start_ms = timestamp_ms(signal["scan_time"])
+    candles = fetch_subsequent_klines(signal["symbol"], start_ms, interval=sim_interval, limit=500)
+    if not candles and signal.get("replay_version") == REPLAY_VERSION:
+        return dict(signal, replay_note="No closed candles fetched; previous replay preserved")
+    if db_path and candles:
+        save_candles(db_path, signal["symbol"], sim_interval, candles)
+    return replay_trade(signal, candles, interval=sim_interval,
+                        fill_timeout_hours=fill_timeout_hours,
+                        trade_timeout_hours=trade_timeout_hours, costs=costs)
 
 
 def run_outcome_tracker(
     timeout_hours: float = TIME_STOP_HOURS,
     force_recheck: bool = False,
-    db_path: str = DB_PATH
+    db_path: str = DB_PATH,
+    fee_bps: float = 10.0,
+    slippage_bps: float = 5.0,
+    fill_timeout_hours: float = 2.0,
 ) -> pd.DataFrame:
     """
     Menjalankan evaluasi penuh seluruh sinyal historis yang masih PENDING.
@@ -472,20 +268,20 @@ def run_outcome_tracker(
     init_outcome_tracker_db(db_path)
     import_signals_from_history(db_path)
 
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         if force_recheck:
             cursor.execute("SELECT * FROM signal_outcomes ORDER BY scan_time ASC")
         else:
-            cursor.execute("SELECT * FROM signal_outcomes WHERE result = 'PENDING' ORDER BY scan_time ASC")
+            cursor.execute("SELECT * FROM signal_outcomes WHERE result IN ('PENDING', 'DATA_UNAVAILABLE') OR replay_version=? ORDER BY scan_time ASC", (REPLAY_VERSION,))
         rows = cursor.fetchall()
         signals = [dict(r) for r in rows]
 
     if not signals:
         print("[*] Tidak ada sinyal yang perlu dievaluasi saat ini.")
         # Baca seluruh outcomes yang sudah selesai untuk dicetak scoreboarnya
-        with sqlite3.connect(db_path) as conn:
+        with closing(sqlite3.connect(db_path)) as conn:
             df_all = pd.read_sql("SELECT * FROM signal_outcomes ORDER BY scan_time DESC", conn)
         print_outcome_scoreboard(df_all)
         return df_all
@@ -493,12 +289,26 @@ def run_outcome_tracker(
     print(f"\n[*] Menjalankan evaluasi empiris pada {len(signals)} sinyal dari Binance API...")
     updated_records = []
 
+    costs = Costs(fee_bps, slippage_bps)
     for s in signals:
-        evaluated = evaluate_single_signal(s, sim_interval="1h", trade_timeout_hours=timeout_hours)
+        if not is_trade_eligible(s):
+            continue
+        # A trade can finish before the experiment/forward-mark window. Keep
+        # collecting that path on later runs rather than losing early winners.
+        if not force_recheck and s.get("replay_version") == REPLAY_VERSION and s["result"] not in ("PENDING", "DATA_UNAVAILABLE"):
+            with closing(sqlite3.connect(db_path)) as conn:
+                cached = conn.execute("SELECT 1 FROM sqlite_master WHERE name='replay_candles'").fetchone()
+                last = conn.execute("SELECT MAX(open_time) FROM replay_candles WHERE symbol=? AND interval='15m'", (s["symbol"],)).fetchone()[0] if cached else None
+            same_costs = s.get("fee_bps") == fee_bps and s.get("slippage_bps") == slippage_bps
+            same_window = s.get("fill_timeout_hours") == fill_timeout_hours and s.get("trade_timeout_hours") == timeout_hours
+            if last and last >= timestamp_ms(s["scan_time"]) + 50.25 * 3_600_000 and same_costs and same_window:
+                continue
+        evaluated = evaluate_single_signal(s, sim_interval="15m", trade_timeout_hours=timeout_hours,
+            fill_timeout_hours=fill_timeout_hours, costs=costs, db_path=db_path)
         updated_records.append(evaluated)
 
     # Simpan kembali hasil evaluasi ke database
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         cursor = conn.cursor()
         update_query = """
             UPDATE signal_outcomes
@@ -514,9 +324,14 @@ def run_outcome_tracker(
                 r["return_12h_pct"], r["return_24h_pct"], r["return_48h_pct"], r["evaluated_at"],
                 r["scan_time"], r["symbol"]
             ))
+            extras = ["exit_price", "net_return_pct", "gross_return_pct", "replay_version",
+                      "replay_interval", "fee_bps", "slippage_bps", "replay_note",
+                      "fill_timeout_hours", "trade_timeout_hours"]
+            cursor.execute("UPDATE signal_outcomes SET " + ", ".join(f"{k}=?" for k in extras)
+                + " WHERE scan_time=? AND symbol=?", [r.get(k) for k in extras] + [r["scan_time"], r["symbol"]])
         conn.commit()
 
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         df_all = pd.read_sql("SELECT * FROM signal_outcomes ORDER BY scan_time DESC", conn)
 
     print_outcome_scoreboard(df_all)
@@ -524,101 +339,24 @@ def run_outcome_tracker(
 
 
 def print_outcome_scoreboard(df: pd.DataFrame) -> None:
-    """Mencetak Scoreboard Kuantitatif yang komprehensif di terminal."""
+    """Report only current eligible replay cohorts with identical cost assumptions."""
     if df.empty:
-        print("[!] Belum ada rekaman sinyal di Outcome Tracker.")
+        print("[*] Belum ada rekaman outcome.")
         return
-
-    total_signals = len(df)
-    filled_df = df[df["is_filled"] == 1]
-    total_filled = len(filled_df)
-    fill_rate = (total_filled / total_signals * 100.0) if total_signals > 0 else 0.0
-
-    tp1_hits = len(df[df["result"].isin(["TP1_HIT", "TP2_HIT"])])
-    tp2_hits = len(df[df["result"] == "TP2_HIT"])
-    sl_hits = len(df[df["result"] == "SL_HIT"])
-    timeouts = len(df[df["result"] == "TIMEOUT"])
-    unfilled = len(df[df["result"] == "UNFILLED"])
-    pending = len(df[df["result"] == "PENDING"])
-
-    # Win rate dihitung dari order yang BENAR-BENAR TERISI (bukan unfilled)
-    completed_filled = tp1_hits + sl_hits + timeouts
-    win_rate = (tp1_hits / completed_filled * 100.0) if completed_filled > 0 else 0.0
-    loss_rate = (sl_hits / completed_filled * 100.0) if completed_filled > 0 else 0.0
-    timeout_rate = (timeouts / completed_filled * 100.0) if completed_filled > 0 else 0.0
-
-    avg_mfe = filled_df["mfe_pct"].mean() if not filled_df.empty else 0.0
-    avg_mae = filled_df["mae_pct"].mean() if not filled_df.empty else 0.0
-
-    dur_hits = filled_df[filled_df["duration_hours"] > 0]["duration_hours"]
-    avg_dur = dur_hits.mean() if not dur_hits.empty else 0.0
-
-    print("\n" + "=" * 115)
-    print("📊 KRIPIKTO EMPIRICAL OUTCOME TRACKER SCOREBOARD (PENGUKURAN VALIDITAS SISTEM)")
-    print("=" * 115)
-    print(f"Total Sinyal Terlacak : {total_signals:<6} | Terisi (Filled) : {total_filled:<5} ({fill_rate:.1f}%) | Belum Terisi (Unfilled) : {unfilled}")
-    print(f"Win Rate (Hit TP1)    : {win_rate:.1f}% ({tp1_hits} trades) [TP2 Hit: {tp2_hits}]")
-    print(f"Loss Rate (Hit SL)    : {loss_rate:.1f}% ({sl_hits} trades)")
-    print(f"Timeout (Sideways)    : {timeout_rate:.1f}% ({timeouts} trades)")
-    print(f"Trade Berjalan (Live) : {pending} trades")
-    print("-" * 115)
-    print(f"Rata-rata MFE (Max Profit Terbuka) : {avg_mfe:+.2f}%  (Seberapa jauh harga sempat naik)")
-    print(f"Rata-rata MAE (Max Drawdown Alami)  : {avg_mae:+.2f}%  (Uji apakah SL terlalu ketat)")
-    print(f"Rata-rata Durasi Trade Selesai     : {avg_dur:.1f} jam")
-    print("=" * 115)
-
-    # Breakdown performa berdasarkan TAKSONOMI SETUP KripikTo v2
-    if "setup_type" in df.columns:
-        valid_setups = df[df["setup_type"].notnull() & (df["setup_type"] != "")]
-        if not valid_setups.empty:
-            print("\n🔍 EVALUASI EMPIRIS BERDASARKAN TAKSONOMI SETUP (v2):")
-            print(f"{'SETUP TYPE':<22} {'TOTAL':<7} {'FILLED':<8} {'WIN RATE':<10} {'AVG MFE':<10} {'AVG MAE':<10}")
-            print("-" * 75)
-            for stype, grp in valid_setups.groupby("setup_type"):
-                st_tot = len(grp)
-                st_filled = grp[grp["is_filled"] == 1]
-                st_fill_cnt = len(st_filled)
-                st_wins = len(st_filled[st_filled["result"].isin(["TP1_HIT", "TP2_HIT"])])
-                st_losses = len(st_filled[st_filled["result"] == "SL_HIT"])
-                st_finished = st_wins + st_losses + len(st_filled[st_filled["result"] == "TIMEOUT"])
-                st_wr = (st_wins / st_finished * 100.0) if st_finished > 0 else 0.0
-                st_mfe = st_filled["mfe_pct"].mean() if not st_filled.empty else 0.0
-                st_mae = st_filled["mae_pct"].mean() if not st_filled.empty else 0.0
-                print(f"{stype:<22} {st_tot:<7} {st_fill_cnt:<8} {st_wr:>5.1f}%     {st_mfe:>+5.2f}%     {st_mae:>+5.2f}%")
-            print("-" * 75)
-
-    print("\n📋 RINCIAN TRACKING INDIVIDUAL (SAMPLE TOP SINYAL HISTORIS):")
-    print(f"{'WAKTU SCAN':<19} {'SIMBOL':<10} {'FILL PRICE':<11} {'TP1':<10} {'SL':<10} {'STATUS':<10} {'MFE %':<8} {'MAE %':<8} {'DURASI':<8}")
-    print("-" * 115)
-
-    for _, row in df.head(15).iterrows():
-        st_time = row["scan_time"][:16]
-        fp_val = row.get('fill_price')
-        if pd.notnull(fp_val) and fp_val > 0:
-            fp_str = f"${fp_val:.4f}" if fp_val < 1 else f"${fp_val:.2f}"
-        else:
-            fp_str = "-"
-        tp_str = f"${row['tp1']:.4f}" if pd.notnull(row['tp1']) and row['tp1'] < 1 else f"${row['tp1']:.2f}"
-        sl_str = f"${row['stop_loss']:.4f}" if pd.notnull(row['stop_loss']) and row['stop_loss'] < 1 else f"${row['stop_loss']:.2f}"
-        mfe_str = f"{row['mfe_pct']:+.1f}%" if pd.notnull(row['mfe_pct']) else "0.0%"
-        mae_str = f"{row['mae_pct']:+.1f}%" if pd.notnull(row['mae_pct']) else "0.0%"
-        dur_str = f"{row['duration_hours']:.1f}h" if row['duration_hours'] > 0 else "-"
-        res_str = row["result"]
-
-        if res_str in ["TP1_HIT", "TP2_HIT"]:
-            res_str = f"✅ {res_str}"
-        elif res_str == "SL_HIT":
-            res_str = f"❌ {res_str}"
-        elif res_str == "TIMEOUT":
-            res_str = f"⏳ {res_str}"
-        elif res_str == "UNFILLED":
-            res_str = f"🚫 {res_str}"
-        else:
-            res_str = f"🔄 {res_str}"
-
-        print(f"{st_time:<19} {row['symbol']:<10} {fp_str:<11} {tp_str:<10} {sl_str:<10} {res_str:<10} {mfe_str:<8} {mae_str:<8} {dur_str:<8}")
-
-    print("=" * 115 + "\n")
+    eligible = df.apply(lambda row: is_trade_eligible(row.to_dict()), axis=1)
+    current = df.get("replay_version", pd.Series(None, index=df.index)).eq(REPLAY_VERSION)
+    print(f"[*] Observasi/legacy di luar statistik transaksi: {int((~(eligible & current)).sum())}")
+    df = df[eligible & current].copy()
+    if df.empty:
+        print("[*] Belum ada replay versi terbaru untuk sinyal entry yang memenuhi syarat.")
+        return
+    cohorts = ["replay_interval", "fee_bps", "slippage_bps", "fill_timeout_hours", "trade_timeout_hours"]
+    for assumptions, group in df.groupby(cohorts, dropna=False):
+        print("\nAsumsi replay:", dict(zip(cohorts, assumptions)))
+        records = group.astype(object).where(pd.notna(group), None).to_dict(orient="records")
+        print(json.dumps(summarize(records), ensure_ascii=False, indent=2, allow_nan=False))
+    print("\nHasil per trade setelah biaya (bukan return portofolio):")
+    print(df[["scan_time", "symbol", "result", "fill_price", "exit_price", "net_return_pct"]].head(15).to_string(index=False))
 
 
 if __name__ == "__main__":
@@ -626,6 +364,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="KripikTo Outcome Tracker: Empirical Performance Engine")
     parser.add_argument("--timeout", type=float, default=TIME_STOP_HOURS, help="Batas jam timeout posisi sideways (default: 6 jam)")
     parser.add_argument("--recheck", action="store_true", help="Evaluasi ulang seluruh riwayat sinyal dari nol")
+    parser.add_argument("--db", default=DB_PATH)
+    parser.add_argument("--fee-bps", type=float, default=10.0, help="Asumsi fee per sisi, basis points")
+    parser.add_argument("--slippage-bps", type=float, default=5.0, help="Asumsi slippage per sisi, basis points")
+    parser.add_argument("--fill-timeout", type=float, default=2.0, help="Masa berlaku entry limit dalam jam")
     args = parser.parse_args()
 
-    run_outcome_tracker(timeout_hours=args.timeout, force_recheck=args.recheck)
+    run_outcome_tracker(timeout_hours=args.timeout, force_recheck=args.recheck, db_path=args.db,
+                        fee_bps=args.fee_bps, slippage_bps=args.slippage_bps,
+                        fill_timeout_hours=args.fill_timeout)

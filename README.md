@@ -18,7 +18,7 @@ harga itu. Fill yang berbenturan dengan TP/SL dalam satu candle menjadi `AMBIGUO
 Evaluasi direkonstruksi dari waktu scan dan memakai time-stop default 6 jam.
 Timestamp fill/exit dari OHLC memiliki resolusi candle, bukan waktu transaksi aktual.
 
-Scanner memvalidasi 51 candle struktur, 35 candle momentum 1H, dan 21 candle
+Scanner memvalidasi 51 candle struktur, 35 candle momentum 1H, dan 29 candle
 trigger 15M terbaru. Candle harus memiliki `is_closed=1`, metadata waktu lengkap,
 OHLC/volume valid, dan urutan tanpa duplikasi atau jeda. Umur candle terakhir dan
 pengambilannya dibatasi satu interval + toleransi 60 detik; snapshot ticker 24 jam
@@ -33,6 +33,70 @@ tidak diganti return BTC nol. Kolom `rs_structure` berlaku pada semua interval;
 kolom kompatibilitas `rs_4h` hanya terisi untuk scan 4H. Kekurangan data momentum,
 benchmark, atau trigger membuat kandidat `PARTIAL` dan memblokir entry baru.
 Alasan penolakan tersimpan di `backend/data/data_quality_latest.json`.
+
+## Replay dan eksperimen strategi (v3)
+
+Skor mentah pilar tetap berskala 25/30/20/15. Kontribusi dihitung dengan
+`raw / maksimum_raw * bobot`, memakai helper yang sama di scanner dan kalibrasi.
+Klasifikasi setup memakai skor mentah sehingga perubahan bobot tidak mengubah
+definisi setup. Skor teknikal dibatasi 90; 10 poin tersedia untuk berita opsional.
+Makro menjadi modifier eksplisit (`macro_score - 5`) dan penalti disimpan terpisah.
+Snapshot menyimpan `scoring_version`, bobot, kontribusi, support, jenis trigger,
+dan level breakout. Konfigurasi kalibrasi lama tanpa validasi versi baru diabaikan;
+baseline digunakan sampai konfigurasi baru lolos pemeriksaan.
+
+Jalankan dari direktori proyek dengan environment Python yang dependensinya lengkap:
+
+```powershell
+# Scan baru tanpa RSS/Gemini
+python main.py --no-news
+
+# Setelah harga bergerak, kumpulkan candle dan evaluasi sinyal yang layak entry
+python -m backend.outcome_tracker --fee-bps 10 --slippage-bps 5
+
+# Bandingkan dua entry pada snapshot breakout dan forward window yang sama
+python -m backend.strategy_comparison --fee-bps 10 --slippage-bps 5
+
+# Kalibrasi TP/SL memakai replay; --apply hanya menyimpan jika pemeriksaan lolos
+python -m backend.calibration_lab
+python -m unittest discover -s tests -v
+```
+
+Environment lokal yang dibuat untuk pengujian tersedia di `venv/`; pada Windows
+gunakan `.\venv\Scripts\python.exe` sebagai pengganti `python` bila `.venv/` lama rusak.
+
+Replay memakai candle 15M tertutup, entry limit maksimum 2 jam, dan time-stop
+6 jam sejak candle fill. Candle yang hilang/duplikat ditolak. Waktu fill/exit
+tetap perkiraan pada resolusi candle. Fill dan exit dalam candle limit yang sama,
+atau TP/SL yang urutannya tidak diketahui, menjadi `AMBIGUOUS` tanpa P&L buatan.
+Strategi exit utama menutup seluruh posisi di TP1; TP2 bukan partial exit tersimulasi.
+Timeout memakai harga open pada batas waktu, stop yang gap memakai harga open,
+dan return observasi 12/24/48H dihitung terpisah jika datanya tersedia.
+
+Fee default **10 bps (0,10%) per sisi** dan slippage **5 bps (0,05%) pada eksekusi
+market** adalah asumsi eksperimen yang dapat diubah, bukan tarif resmi bursa.
+Limit entry dan TP limit tidak diberi slippage yang melanggar harga limit. Simulasi
+touch belum memodelkan antrean order, partial fill, ukuran posisi atau kedalaman book.
+Hasil `WAIT`, `EXTENDED`, kualitas data tidak lengkap, dan blokir eksekusi eksplisit
+tidak masuk statistik transaksi. Hasil legacy dipisahkan; gunakan `--recheck` bila
+ingin memperbarui replay lama yang layak entry. Candle utuh disimpan di tabel
+`replay_candles` agar eksperimen exit tidak bergantung pada MFE/MAE yang terpotong.
+
+Perbandingan A/B khusus snapshot `TRIGGERED` + `BREAKOUT` versi baru:
+breakout masuk market pada open candle sesudah scan; retest menunggu candle
+berikutnya menyentuh resistance yang disimpan dan close bullish di atasnya,
+lalu masuk pada open berikutnya. Close di bawah level membatalkan retest.
+Keduanya menggunakan stop/target absolut yang sama dan jendela data lengkap
+8 jam (tunggu maksimum 2 jam + hold 6 jam). Hasil tersimpan di
+`backend/data/strategy_comparison.json`; data tidak cukup dilaporkan secara eksplisit.
+Return laporan adalah hasil per trade, bukan return portofolio atau drawdown modal:
+sinyal dapat tumpang tindih. Laporan tidak otomatis memilih strategi pemenang.
+
+Kalibrasi memisahkan seluruh timestamp scan dan membuang label train yang
+bertumpang tindih dengan awal test. Eksperimen saat ini menguji TP/SL dengan
+bobot baseline tetap. Penyimpanan memerlukan minimal 10 trade OOS selesai,
+profit factor finite >1 dan expectancy bersih positif. Ini pemeriksaan minimum,
+bukan bukti bahwa strategi sudah optimal atau bebas overfitting.
 
 Sistem pemindai pasar aset kripto otomatis berbasis kombinasi data **Kuantitatif (Candlestick Klines + Whale Flow / Bandarmologi Paus)** dan **Kualitatif (Analisis Sentimen Berita Global dengan Google Gemini Flash LLM + Crypto Risk Guard)**.
 
@@ -122,7 +186,16 @@ python main.py --top 10
 
 # 4. Mode Cepat / Hemat Kuota (Melewati unduhan jika data baru saja diunduh hari ini):
 python main.py --skip-download --top 10
+
+# 5. Scan teknikal tanpa berita RSS / Gemini (tidak memerlukan GEMINI_API_KEY):
+python main.py --no-news
 ```
+
+Saat memakai `--no-news`, hasil teknikal dan Trading Plan tersedia di
+`backend/data/scan_latest.json` serta SQLite. `final_recommendations.json`
+tidak diperbarui karena tahap berita dilewati. Dari Python, gunakan
+`run_all(news_enabled=False)` untuk melewati berita atau
+`run_all(news_enabled=True)` untuk mengaktifkannya (default).
 
 ---
 

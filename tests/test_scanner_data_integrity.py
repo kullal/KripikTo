@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from backend import data_pipeline, scanner
+from backend.scoring import SCORING_VERSION, score_snapshot
 from market_fixture import NOW_MS, candles, seed_database
 
 
@@ -65,6 +66,12 @@ class ScannerDataIntegrityTests(unittest.TestCase):
         self.assertEqual(stored[0]["rs_structure"], expected)
         self.assertEqual(outcomes[0]["data_quality_status"], "OK")
         self.assertEqual(stored[0]["candle_close_time_ms"], NOW_MS - 1)
+        self.assertEqual(stored[0]["scoring_version"], SCORING_VERSION)
+        self.assertEqual(outcomes[0]["scoring_version"], SCORING_VERSION)
+        weights = json.loads(stored[0]["weights_json"])
+        expected_score, components = score_snapshot(stored[0], weights)
+        self.assertEqual(stored[0]["v2_score"], expected_score)
+        self.assertEqual(json.loads(stored[0]["score_components_json"]), components)
         self.assertEqual(report["checks"]["trigger_15m"]["accepted_symbols"], 1)
         self.assertEqual(calls, 1)
 

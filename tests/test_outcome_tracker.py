@@ -20,13 +20,14 @@ def candle(hour, low=99.0, high=102.0, close=101.0):
 class OutcomeTrackerTests(unittest.TestCase):
     def evaluate(self, candles, overrides=None, **kwargs):
         signal = {
-            "scan_time": "2026-09-30 00:00:00", "symbol": "TESTUSDT",
+            "scan_time": "2026-09-30 01:00:00", "symbol": "TESTUSDT",
             "buy_low": 99.0, "buy_high": 101.0, "entry_price": 100.0,
             "stop_loss": 95.0, "tp1": 110.0, "tp2": 120.0,
         }
         signal.update(overrides or {})
         with patch.object(outcome_tracker, "fetch_subsequent_klines", return_value=candles):
-            return outcome_tracker.evaluate_single_signal(signal, **kwargs)
+            return outcome_tracker.evaluate_single_signal(signal, sim_interval="1h",
+                costs=outcome_tracker.Costs(0, 0), fill_timeout_hours=24, **kwargs)
 
     def test_touching_buy_area_does_not_fill_unreached_entry(self):
         result = self.evaluate([candle(1, low=100.8, high=103.0)])
@@ -72,13 +73,14 @@ class OutcomeTrackerTests(unittest.TestCase):
         self.assertEqual(result["result"], "SL_HIT")
 
     def test_timeout_excludes_price_moves_after_six_hour_deadline(self):
-        result = self.evaluate([candle(1), candle(7, high=121.0)])
+        result = self.evaluate([candle(1)] + [candle(h, low=100, high=100, close=100) for h in range(2, 7)]
+                               + [candle(7, high=121.0)])
         self.assertEqual(result["result"], "TIMEOUT")
         self.assertEqual(result["duration_hours"], 6.0)
         self.assertEqual(result["mfe_pct"], 0.0)
 
     def test_limit_expiry_is_checked_before_accepting_fill(self):
-        result = self.evaluate([candle(24)])
+        result = self.evaluate([candle(h, low=101, high=103, close=102) for h in range(1, 25)] + [candle(25)])
         self.assertEqual(result["result"], "UNFILLED")
         self.assertEqual(result["is_filled"], 0)
 
