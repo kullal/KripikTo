@@ -724,12 +724,27 @@ def run_scanner(
         # =========================================================================
         # 4. TRADING PLAN & TARGET PROFIT / STOP LOSS DINAMIS (BERBASIS ATR 1H)
         # =========================================================================
-        if "BREAKOUT_20_BAR_HIGH" in signals or "MENDEKATI_BREAKOUT" in signals:
-            support_level = max(ma20, prev_high20) if prev_high20 > 0 else ma20
+        if "BREAKOUT_20_BAR_HIGH" in signals and prev_high20 > 0 and prev_high20 < close:
+            support_level = max(ma20, prev_high20) if ma20 < close else prev_high20
         else:
-            support_level = ma20 if ma20 < close else max(prev_low20, close * 0.96)
+            if ma20 < close:
+                support_level = ma20
+            elif prev_low20 > 0 and prev_low20 < close:
+                support_level = prev_low20
+            else:
+                support_level = close * 0.96
+        # Pastikan support_level selalu secara ketat berada di bawah harga saat ini
+        support_level = min(support_level, close * 0.995)
 
         dec = 8 if close < 0.01 else (6 if close < 1.0 else 4)
+
+        # Deteksi apakah harga menempel di plafon resistensi 20-bar tanpa breakout
+        range_pos = (close - prev_low20) / (prev_high20 - prev_low20) if (prev_high20 > prev_low20 > 0) else 0.5
+        is_near_resistance = (
+            "MENDEKATI_BREAKOUT" in signals
+            or (prev_high20 > 0 and close >= prev_high20 * 0.975 and close <= prev_high20)
+            or (range_pos >= 0.80 and close <= prev_high20)
+        )
 
         if is_overextended:
             signals.append("⏳ TUNGGU_RETEST (Antre Diskon di Support)")
@@ -738,6 +753,15 @@ def run_scanner(
             if buy_low >= buy_high:
                 buy_low = round(close * 0.95, dec)
                 buy_high = round(close * 0.975, dec)
+        elif is_near_resistance:
+            signals.append("⚠️ DI_AREA_RESISTEN (Rawan Rejeksi, Tunggu Tembus / Pullback)")
+            # Jangan sarankan beli tepat di atap resistensi tanpa konfirmasi.
+            # Area antre sehat sebelum tembus adalah menunggu pullback ke area support struktural:
+            buy_low = round(max(support_level * 0.992, close * 0.94), dec)
+            buy_high = round(min(support_level * 1.015, close * 0.98), dec)
+            if buy_low >= buy_high:
+                buy_low = round(close * 0.95, dec)
+                buy_high = round(close * 0.98, dec)
         else:
             signals.append("🎯 AREA_BUY_SEHAT (Dekat Support)")
             buy_low = round(max(support_level * 0.995, close * 0.982), dec)

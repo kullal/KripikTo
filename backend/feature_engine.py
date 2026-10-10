@@ -238,7 +238,8 @@ def calculate_dynamic_tp_sl(
         raise ValueError("stop_loss_pct harus memiliki magnitudo antara 0 dan 100.")
 
     # stop_loss_pct is a maximum loss distance, not a mandatory exact stop.
-    structural_sl = min(support_level * 0.990, entry_price - (sl_mult * atr_val))
+    safe_support = min(support_level, entry_price * 0.995)
+    structural_sl = min(safe_support * 0.990, entry_price - (sl_mult * atr_val))
     max_sl_price = entry_price * (1.0 - (target_sl_pct / 100.0))
     # Round the risk floor upward so price precision cannot exceed the risk cap.
     price_scale = 10 ** dec

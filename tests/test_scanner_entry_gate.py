@@ -13,7 +13,7 @@ from backend import data_pipeline, scanner
 
 
 class ScannerEntryGateTests(unittest.TestCase):
-    def run_scan(self, initial_status, trigger_status, setup="MOMENTUM_RUNNER"):
+    def run_scan(self, initial_status, trigger_status, setup="MOMENTUM_RUNNER", price_fn=None):
         with tempfile.TemporaryDirectory(prefix="kripikto-entry-test-") as folder:
             db_path = str(Path(folder) / "test.db")
             json_path = str(Path(folder) / "scan.json")
@@ -32,7 +32,7 @@ class ScannerEntryGateTests(unittest.TestCase):
                         for index in range(60):
                             timestamp = start + datetime.timedelta(hours=hours * index)
                             open_time = int(timestamp.timestamp() * 1000)
-                            price = 100.0 + index * 0.3
+                            price = price_fn(index) if price_fn else 100.0 + index * 0.3
                             conn.execute("""
                             INSERT INTO klines_history (
                                 symbol, interval, open_time, close_time, datetime_utc,
@@ -100,6 +100,16 @@ class ScannerEntryGateTests(unittest.TestCase):
     def test_breakdown_invalidates_accumulation(self):
         pick = self.run_scan("WAIT", "FAILED", setup="ACCUMULATION_COIL")
         self.assertEqual(pick["entry_status"], "FAILED")
+
+    def test_near_resistance_sets_warning_and_safe_support(self):
+        def healthy_range_price(i):
+            if i == 59:
+                return 101.4  # close to high20 (101.5), but not overextended
+            return 100.0 + (i % 6) * 0.25
+        pick = self.run_scan("WAIT", "WAIT", setup="STRUCTURE_BULLISH", price_fn=healthy_range_price)
+        self.assertLess(pick["support_level"], pick["last_price"])
+        self.assertIn("DI_AREA_RESISTEN", pick["signals"])
+        self.assertNotIn("AREA_BUY_SEHAT", pick["signals"])
 
 
 if __name__ == "__main__":

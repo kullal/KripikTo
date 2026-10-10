@@ -75,6 +75,11 @@ class EntryRiskTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     feature_engine.calculate_dynamic_tp_sl(100.0, 95.0, 2.0)
 
+    def test_support_level_guard_caps_stop_loss_below_entry(self):
+        plan = feature_engine.calculate_dynamic_tp_sl(entry_price=100.0, support_level=105.0, atr_val=2.0)
+        self.assertLess(plan["stop_loss"], 100.0)
+        self.assertLess(plan["stop_loss_pct"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

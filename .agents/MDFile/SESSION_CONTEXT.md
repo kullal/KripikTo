@@ -1,6 +1,6 @@
 # Ringkasan sesi KripikTo
 
-Terakhir diperbarui: 2026-10-09, zona pengguna Asia/Jakarta.
+Terakhir diperbarui: 2026-10-10, zona pengguna Asia/Jakarta.
 Workspace: `D:\Repo\KripikTo`, shell PowerShell.
 Branch saat diperiksa: `kripiktoV4A`.
 Commit implementasi terakhir: `ec2f9d3` (`feat: 3 features`).
@@ -111,15 +111,15 @@ scan tidak menciptakan data masa depan.
 
 ## Validasi yang sudah dilakukan
 
-Pada sesi implementasi sebelumnya, seluruh **81 test unittest lulus** dan
-`git diff --check` bersih. Ini hasil validasi historis sesi tersebut, bukan klaim
-bahwa test dijalankan ulang saat menulis ringkasan ini. Test mencakup replay
-berurutan, biaya, gap, ambigu, invalid data, expiry, timeout, scoring bersama,
-retest, pairing, cache, eligibility, dan guard kalibrasi.
+Pada sesi validasi terkini, seluruh **83 test unittest lulus** dan
+`git diff --check` bersih. Test mencakup replay berurutan, biaya, gap, ambigu,
+invalid data, expiry, timeout, scoring bersama, retest, pairing, cache,
+eligibility, guard kalibrasi, batas risiko SL struktural, serta perbaikan
+penentuan `support_level` dan sinyal `⚠️ DI_AREA_RESISTEN` agar level resistensi
+tidak keliru ditetapkan sebagai support sebelum breakout terkonfirmasi.
 
-Environment `venv` dibuat dan dependencies requirements dipasang. `.venv`
-lama sebelumnya menunjuk interpreter di profil pengguna ACER yang tidak ada.
-Gunakan `.\venv\Scripts\python.exe`; cek ulang environment jika mesin berubah.
+Environment `venv` dibuat dan dependencies requirements dipasang.
+Gunakan `.\venv\Scripts\python.exe`.
 
 ## Kondisi data terakhir yang diverifikasi
 
