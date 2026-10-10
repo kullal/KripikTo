@@ -148,9 +148,11 @@ Gunakan `.\venv\Scripts\python.exe`.
 3. News fallback/risk guard dan kontrak timestamp snapshot news masih perlu
    audit bila pengguna ingin memakai mode news lagi. `--no-news` tidak memperbarui
    final recommendations lama dan tidak berarti risiko berita terverifikasi.
-4. Integrasi otomatis tracker/comparison ke main atau scheduler belum dibuat.
-   Jika nanti diminta, hindari menunggu 8 jam secara blocking; evaluasi sinyal
-   historis yang datanya sudah tersedia dan laporkan pending secara jelas.
+4. Integrasi otomatis scanner berkala (15 menit) telah diimplementasikan:
+   - Script runner: `backend/cron_runner.py` (menjalankan pipeline MTF, scanner 15M, outcome tracker berkala, dan kirim notifikasi).
+   - Watchdog script: `~/AppData/Local/hermes/scripts/kripikto_cron.py`.
+   - Modul notifikasi: `backend/notifier.py` mendukung WhatsApp (CallMeBot / Fonnte) dan Telegram dengan konfigurasi di `backend/data/notifier_config.json`.
+   - Cronjob Hermes: `kripikto-15m-scanner` terdaftar (schedule: `15m`, mode: `no_agent: true`).
 5. Kalibrasi lanjut (walk-forward berulang, risiko overfitting, model portofolio)
    belum diterapkan. Pertahankan prinsip measurement before optimization.
 
